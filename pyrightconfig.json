@@ -1,0 +1,9 @@
+{
+  "venvPath": "/home/josh/99/99_Final",
+  "venv": "venv",
+  "pythonVersion": "3.12",
+  "extraPaths": [
+    "/home/josh/99/99_Final/aioquic_99/src",
+    "/home/josh/99/99_Final/pylsqpack_99/src"
+  ]
+}
