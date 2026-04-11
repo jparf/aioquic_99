@@ -23,9 +23,7 @@ import logging
 import socket
 import ssl
 from dataclasses import dataclass, field
-from typing import Callable, Optional
-
-import pylsqpack
+from typing import Any, Callable, Optional
 
 from aioquic.asyncio.protocol import QuicConnectionProtocol
 from aioquic.asyncio.server import QuicServer, serve
@@ -126,7 +124,7 @@ class _EncoderProxy:
 
     def __init__(
         self,
-        real_encoder: pylsqpack.Encoder,
+        real_encoder: Any,
         on_settings: Callable[[int, int], None],
         decoder_log: list[bytes],
     ) -> None:
