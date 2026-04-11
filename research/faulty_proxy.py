@@ -22,6 +22,7 @@ import asyncio
 import logging
 import socket
 import ssl
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -50,6 +51,7 @@ class InsertionEvent:
     abs_index: int      # absolute table index of the new entry
     name: bytes
     value: bytes
+    request_id: int = -1
 
 
 @dataclass
@@ -57,20 +59,135 @@ class ReferenceEvent:
     client_id: str
     rel_index: int          # relative table index used in the header block
     name: bytes
-    referenced_value: bytes  # value actually in the table (may differ)
+    referenced_value: bytes  # value actually in the table (may differ from intended)
     intended_value: bytes    # value the client meant to send
+    request_id: int = -1
+    inserted_by: str = ""   # client_id that last inserted this table entry
+    root_cause: str = ""    # "name_match_reuse", "cross_client_insertion", "clean", …
+
+
+@dataclass
+class RequestRecord:
+    """Complete record of a single forwarded request.
+
+    Populated incrementally:
+    - ``intended_headers`` and encoding events are set when the proxy
+      re-encodes the request (synchronous, always present).
+    - ``backend_headers`` is set later by calling
+      ``ProxyInstrumentation.record_backend_response()``.
+    """
+
+    request_id: int
+    client_id: str
+    intended_headers: list[tuple[bytes, bytes]]
+    backend_headers: Optional[list[tuple[bytes, bytes]]] = None
+    insertions: list = field(default_factory=list)   # list[InsertionEvent]
+    references: list = field(default_factory=list)   # list[ReferenceEvent]
+
+    def is_contaminated(self) -> bool:
+        """True if any dynamic-table reference resolved to a wrong value."""
+        return any(
+            ev.referenced_value != ev.intended_value for ev in self.references
+        )
+
+    def compute_discrepancies(self) -> list[dict]:
+        """Compare intended vs backend non-pseudo headers.
+
+        Returns a list of dicts with keys: ``name``, ``intended``,
+        ``backend``, ``root_cause``.  Empty if no backend headers are
+        recorded or all headers match.
+        """
+        if self.backend_headers is None:
+            return []
+        intended = {
+            name: value for name, value in self.intended_headers
+            if not name.startswith(b":")
+        }
+        backend = {
+            name: value for name, value in self.backend_headers
+            if not name.startswith(b":")
+        }
+        result = []
+        for name, int_val in intended.items():
+            bk_val = backend.get(name)
+            if bk_val is not None and bk_val != int_val:
+                root_cause = "unknown"
+                for ev in self.references:
+                    if ev.name == name and ev.referenced_value != ev.intended_value:
+                        root_cause = ev.root_cause or "unknown"
+                        break
+                result.append({
+                    "name": name.decode(errors="replace"),
+                    "intended": int_val.decode(errors="replace"),
+                    "backend": bk_val.decode(errors="replace"),
+                    "root_cause": root_cause,
+                })
+        return result
 
 
 class ProxyInstrumentation:
-    """Collects insertion and reference events; produces a human-readable report."""
+    """Collects QPACK encoding events and produces per-request comparison reports.
 
-    def __init__(self) -> None:
+    Usage pattern::
+
+        # The proxy calls these automatically during encoding:
+        #   begin_request(), record_insertion(), record_reference()
+
+        # After each request completes, supply what the backend decoded:
+        proxy.instrumentation.record_backend_response(
+            "client-0",
+            [(b"authorization", b"Bearer tokenX"), ...]
+        )
+
+        print(proxy.instrumentation.generate_report())
+    """
+
+    def __init__(self, mode: str = "", capacity: int = 0) -> None:
+        # Flat event log — preserved for backward compatibility with existing tests
         self.events: list[InsertionEvent | ReferenceEvent] = []
+        # Per-request structured records
+        self._requests: list[RequestRecord] = []
+        self._next_id: int = 0
+        # FIFO queues: client_id → request_ids waiting for backend headers
+        self._pending_backend: dict[str, deque[int]] = {}
+        self._mode = mode
+        self._capacity = capacity
+
+    # ------------------------------------------------------------------
+    # Recording API (called by _SharedQpackReencoder.encode_request)
+    # ------------------------------------------------------------------
+
+    def begin_request(
+        self, client_id: str, intended_headers: list[tuple[bytes, bytes]]
+    ) -> int:
+        """Register a new forwarded request. Returns the assigned request_id."""
+        rid = self._next_id
+        self._next_id += 1
+        self._requests.append(
+            RequestRecord(
+                request_id=rid,
+                client_id=client_id,
+                intended_headers=list(intended_headers),
+            )
+        )
+        self._pending_backend.setdefault(client_id, deque()).append(rid)
+        return rid
 
     def record_insertion(
-        self, client_id: str, abs_index: int, name: bytes, value: bytes
+        self,
+        client_id: str,
+        abs_index: int,
+        name: bytes,
+        value: bytes,
+        request_id: int = -1,
     ) -> None:
-        self.events.append(InsertionEvent(client_id, abs_index, name, value))
+        ev = InsertionEvent(
+            client_id=client_id, abs_index=abs_index,
+            name=name, value=value, request_id=request_id,
+        )
+        self.events.append(ev)
+        if 0 <= request_id < len(self._requests):
+            self._requests[request_id].insertions.append(ev)
 
     def record_reference(
         self,
@@ -79,32 +196,176 @@ class ProxyInstrumentation:
         name: bytes,
         referenced_value: bytes,
         intended_value: bytes,
+        request_id: int = -1,
+        inserted_by: str = "",
+        root_cause: str = "",
     ) -> None:
-        self.events.append(
-            ReferenceEvent(client_id, rel_index, name, referenced_value, intended_value)
+        ev = ReferenceEvent(
+            client_id=client_id, rel_index=rel_index, name=name,
+            referenced_value=referenced_value, intended_value=intended_value,
+            request_id=request_id, inserted_by=inserted_by, root_cause=root_cause,
         )
+        self.events.append(ev)
+        if 0 <= request_id < len(self._requests):
+            self._requests[request_id].references.append(ev)
 
-    def report(self) -> str:
-        lines = [f"ProxyInstrumentation: {len(self.events)} event(s)"]
-        for i, ev in enumerate(self.events):
-            if isinstance(ev, InsertionEvent):
-                lines.append(
-                    f"  [{i}] INSERT  client={ev.client_id} abs={ev.abs_index}"
-                    f" name={ev.name!r} value={ev.value!r}"
-                )
-            else:
-                contaminated = ev.referenced_value != ev.intended_value
-                flag = " *** CONTAMINATED ***" if contaminated else ""
-                lines.append(
-                    f"  [{i}] REF     client={ev.client_id} rel={ev.rel_index}"
-                    f" name={ev.name!r}"
-                    f" referenced={ev.referenced_value!r}"
-                    f" intended={ev.intended_value!r}{flag}"
-                )
-        return "\n".join(lines)
+    def record_backend_response(
+        self,
+        client_id: str,
+        backend_headers: list[tuple[bytes, bytes]],
+    ) -> None:
+        """Associate backend-decoded headers with the oldest pending request for client_id.
+
+        Call this once per completed request (in order) to enable the full
+        comparison diff in ``generate_report()``.  The headers should be the
+        raw ``(name, value)`` tuples as decoded by the backend — pseudo-headers
+        are accepted but excluded from the discrepancy diff.
+        """
+        queue = self._pending_backend.get(client_id)
+        if queue:
+            rid = queue.popleft()
+            if rid < len(self._requests):
+                self._requests[rid].backend_headers = list(backend_headers)
+
+    @property
+    def request_records(self) -> list[RequestRecord]:
+        """All per-request records, in forwarding order."""
+        return list(self._requests)
 
     def clear(self) -> None:
         self.events.clear()
+        self._requests.clear()
+        self._next_id = 0
+        self._pending_backend.clear()
+
+    # ------------------------------------------------------------------
+    # Report generation
+    # ------------------------------------------------------------------
+
+    def report(self) -> str:
+        """Alias for generate_report() — backward compatible."""
+        return self.generate_report()
+
+    def generate_report(self) -> str:
+        """Produce a full human-readable comparison report.
+
+        Each request section shows:
+          - Intended headers (what the client sent to the proxy)
+          - Proxy encoding decisions (INSERTs and REFs, with mismatch flags)
+          - Backend-received headers (if ``record_backend_response`` was called)
+          - A diff highlighting every discrepancy with its root cause
+        """
+        W = 72
+        n_total = len(self._requests)
+        n_contaminated = sum(1 for r in self._requests if r.is_contaminated())
+        n_clean = n_total - n_contaminated
+        has_backend = any(r.backend_headers is not None for r in self._requests)
+
+        lines: list[str] = []
+        lines.append("=" * W)
+        lines.append("FAULTY PROXY REPORT")
+        if self._mode:
+            lines.append(
+                f"  Mode: {self._mode}  |  Table capacity: {self._capacity} bytes"
+            )
+        lines.append(
+            f"  Requests: {n_total}  |  Contaminated: {n_contaminated}"
+            f"  |  Clean: {n_clean}"
+        )
+        if n_total > 0 and not has_backend:
+            lines.append(
+                "  Note: backend headers not recorded."
+                "  Call record_backend_response() for full diff."
+            )
+        lines.append("=" * W)
+
+        for rec in self._requests:
+            status = "*** CONTAMINATED ***" if rec.is_contaminated() else "CLEAN"
+            header_line = f"── Request #{rec.request_id}  [{rec.client_id}]  {status}"
+            lines.append("")
+            lines.append(header_line + "  " + "─" * max(0, W - len(header_line) - 2))
+            lines.append("")
+
+            # ── Intended headers ──────────────────────────────────────────
+            lines.append("  Intended (client → proxy):")
+            for name, value in rec.intended_headers:
+                n = name.decode(errors="replace")
+                v = value.decode(errors="replace")
+                lines.append(f"    {n:<24}  {v}")
+
+            # ── Proxy encoding decisions ──────────────────────────────────
+            lines.append("")
+            lines.append("  Proxy encoding decisions:")
+            if not rec.insertions and not rec.references:
+                lines.append(
+                    "    (no dynamic table activity"
+                    " — all headers encoded as literals or static refs)"
+                )
+            for ev in rec.insertions:
+                n = ev.name.decode(errors="replace")
+                v = ev.value.decode(errors="replace")
+                lines.append(
+                    f"    {n:<24}  →  INSERT  abs={ev.abs_index}  value={v!r}"
+                )
+            for ev in rec.references:
+                n = ev.name.decode(errors="replace")
+                ref_v = ev.referenced_value.decode(errors="replace")
+                int_v = ev.intended_value.decode(errors="replace")
+                mismatch = ev.referenced_value != ev.intended_value
+                flag = "  ← MISMATCH" if mismatch else ""
+                lines.append(
+                    f"    {n:<24}  →  REF  rel={ev.rel_index}"
+                    f"  stored={ref_v!r}{flag}"
+                )
+                if mismatch:
+                    pad = "    " + " " * 26
+                    lines.append(f"{pad}intended={int_v!r}")
+                    if ev.inserted_by:
+                        lines.append(f"{pad}inserted_by={ev.inserted_by}")
+                    if ev.root_cause and ev.root_cause != "clean":
+                        lines.append(f"{pad}root_cause: {ev.root_cause}")
+
+            # ── Backend-received headers ──────────────────────────────────
+            lines.append("")
+            if rec.backend_headers is not None:
+                lines.append("  Backend received (decoded by server):")
+                backend_dict = dict(rec.backend_headers)
+                for name, int_value in rec.intended_headers:
+                    if name.startswith(b":"):
+                        continue
+                    n = name.decode(errors="replace")
+                    bk = backend_dict.get(name, b"(missing)")
+                    bk_str = bk.decode(errors="replace") if isinstance(bk, bytes) else str(bk)
+                    differs = bk != int_value
+                    flag = "  ← DIFFERS FROM INTENDED" if differs else ""
+                    lines.append(f"    {n:<24}  {bk_str}{flag}")
+            else:
+                lines.append(
+                    "  Backend received: not recorded"
+                    " — call record_backend_response()"
+                )
+
+            # ── Diff ──────────────────────────────────────────────────────
+            lines.append("")
+            if rec.backend_headers is not None:
+                discs = rec.compute_discrepancies()
+                if discs:
+                    lines.append("  Discrepancies:")
+                    for d in discs:
+                        lines.append(
+                            f"    {d['name']:<24}  intended : {d['intended']!r}"
+                        )
+                        lines.append(
+                            f"    {' ' * 26}  backend  : {d['backend']!r}"
+                        )
+                        lines.append(
+                            f"    {' ' * 26}  root_cause: {d['root_cause']}"
+                        )
+                else:
+                    lines.append("  Diff: no discrepancies")
+            lines.append("")
+
+        return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +432,9 @@ class _SharedQpackReencoder:
         # Initialized with max_table_capacity=0; updated when backend SETTINGS arrive.
         self._encoder = ManualQpackEncoder(max_table_capacity=desired_capacity)
         self._initialized = False
+        # Tracks which client last inserted each header name — used for root-cause
+        # classification when a reference resolves to a mismatched value.
+        self._inserted_by: dict[bytes, str] = {}
 
     def initialize(self, peer_max_capacity: int) -> bytes:
         """Called when backend SETTINGS arrive. Sets the actual table capacity.
@@ -195,21 +459,26 @@ class _SharedQpackReencoder:
 
         Returns (encoder_stream_instructions, header_block_bytes).
         """
+        request_id = self._instrumentation.begin_request(client_id, headers)
         encoder_instructions = bytearray()
 
+        # ── Phase 1: insertions ──────────────────────────────────────────
         if self._mode == "naive_name_reuse":
             for name, value in headers:
                 if name.startswith(b":"):
                     continue  # pseudo-headers: never insert
                 if self._static_exact(name, value) is not None:
-                    continue  # already in static table
+                    continue  # already in static table, no need to insert
                 if self._dynamic_by_name(name) is not None:
-                    continue  # name already in table — reuse whatever is there
+                    continue  # name already in table — reuse it (the flaw)
                 instr = self._try_insert(name, value)
                 if instr:
                     encoder_instructions.extend(instr)
                     abs_idx = self._encoder.table.insert_count - 1
-                    self._instrumentation.record_insertion(client_id, abs_idx, name, value)
+                    self._inserted_by[name] = client_id
+                    self._instrumentation.record_insertion(
+                        client_id, abs_idx, name, value, request_id=request_id
+                    )
 
         elif self._mode == "insert_all":
             for name, value in headers:
@@ -221,9 +490,12 @@ class _SharedQpackReencoder:
                 if instr:
                     encoder_instructions.extend(instr)
                     abs_idx = self._encoder.table.insert_count - 1
-                    self._instrumentation.record_insertion(client_id, abs_idx, name, value)
+                    self._inserted_by[name] = client_id
+                    self._instrumentation.record_insertion(
+                        client_id, abs_idx, name, value, request_id=request_id
+                    )
 
-        # Phase 2: build header block
+        # ── Phase 2: build header block ──────────────────────────────────
         header_entries = []
         has_dynamic = False
         for name, value in headers:
@@ -234,8 +506,22 @@ class _SharedQpackReencoder:
                 dyn = self._dynamic_by_name(name)
                 if dyn is not None:
                     rel_idx, stored_value = dyn
+                    inserter = self._inserted_by.get(name, "")
+                    contaminated = stored_value != value
+                    if contaminated:
+                        causes = []
+                        if self._mode == "naive_name_reuse":
+                            causes.append("name_match_reuse")
+                        if inserter and inserter != client_id:
+                            causes.append("cross_client_insertion")
+                        root_cause = ", ".join(causes) if causes else "unknown"
+                    else:
+                        root_cause = "clean"
                     self._instrumentation.record_reference(
-                        client_id, rel_idx, name, stored_value, value
+                        client_id, rel_idx, name, stored_value, value,
+                        request_id=request_id,
+                        inserted_by=inserter,
+                        root_cause=root_cause,
                     )
                     header_entries.append(("dynamic", rel_idx, name, stored_value))
                     has_dynamic = True
@@ -618,7 +904,7 @@ class FaultyProxy:
             raise ValueError(f"mode must be 'naive_name_reuse' or 'insert_all', got {mode!r}")
         self._mode = mode
         self._table_capacity = table_capacity
-        self._instrumentation = ProxyInstrumentation()
+        self._instrumentation = ProxyInstrumentation(mode=mode, capacity=table_capacity)
         self._shared_qpack = _SharedQpackReencoder(
             mode=mode,
             desired_capacity=table_capacity,

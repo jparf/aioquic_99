@@ -231,6 +231,22 @@ def _parse_echo_headers(events: deque[H3Event]) -> dict[str, str]:
     return {row[0]: row[1] for row in data.get("headers", [])}
 
 
+def _parse_echo_headers_as_list(events: deque[H3Event]) -> list[tuple[bytes, bytes]]:
+    """Parse the echo server's JSON body into a (name, value) bytes list.
+
+    Suitable for passing directly to
+    ``ProxyInstrumentation.record_backend_response()``.
+    """
+    body = _get_response_body(events)
+    if not body:
+        return []
+    data = json.loads(body)
+    return [
+        (row[0].encode(), row[1].encode())
+        for row in data.get("headers", [])
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -524,6 +540,109 @@ class FaultyProxyTest(TestCase):
                 self.assertEqual(ref.intended_value, b"Bearer tokenB")
                 self.assertEqual(ref.referenced_value, b"Bearer tokenA")
                 self.assertNotEqual(ref.referenced_value, ref.intended_value)
+            finally:
+                client_a.close()
+                client_b.close()
+                transport_a.close()
+                transport_b.close()
+        finally:
+            proxy.stop()
+            echo_server.close()
+
+    @asynctest
+    async def test_generate_report(self):
+        """generate_report() produces a complete comparison report with discrepancies.
+
+        Runs the credential-swap scenario, supplies backend headers via
+        record_backend_response(), then validates the report contains:
+          - A CLEAN section for client-0's request (tokenA inserted, backend got tokenA)
+          - A CONTAMINATED section for client-1's request (tokenB intended, tokenA arrived)
+          - Root-cause classification: name_match_reuse and cross_client_insertion
+          - A Discrepancies block naming the authorization header
+        """
+        echo_server, echo_port = await _start_echo_server()
+        proxy = FaultyProxy(mode="naive_name_reuse", table_capacity=4096)
+        proxy_port = await proxy.start(
+            listen_port=0,
+            backend_host="localhost",
+            backend_port=echo_port,
+            cert_file=SERVER_CERTFILE,
+            key_file=SERVER_KEYFILE,
+        )
+        try:
+            client_a, transport_a = await _create_client("localhost", proxy_port)
+            client_b, transport_b = await _create_client("localhost", proxy_port)
+            try:
+                # Client A: inserts Authorization: Bearer tokenA into shared table
+                events_a = await client_a.get(
+                    "localhost", proxy_port, "/resource",
+                    extra_headers=[(b"authorization", b"Bearer tokenA")],
+                )
+                self.assertEqual(_get_response_headers(events_a).get(":status"), "200")
+                proxy.instrumentation.record_backend_response(
+                    "client-0", _parse_echo_headers_as_list(events_a)
+                )
+
+                await asyncio.sleep(0.05)
+
+                # Client B: proxy finds "authorization" by name → references tokenA
+                events_b = await client_b.get(
+                    "localhost", proxy_port, "/resource",
+                    extra_headers=[(b"authorization", b"Bearer tokenB")],
+                )
+                self.assertEqual(_get_response_headers(events_b).get(":status"), "200")
+                proxy.instrumentation.record_backend_response(
+                    "client-1", _parse_echo_headers_as_list(events_b)
+                )
+
+                report = proxy.instrumentation.generate_report()
+
+                # Header and summary
+                self.assertIn("FAULTY PROXY REPORT", report)
+                self.assertIn("naive_name_reuse", report)
+                self.assertIn("Contaminated: 1", report)
+                self.assertIn("Clean: 1", report)
+
+                # Client A's request was clean; client B's was contaminated
+                self.assertIn("CLEAN", report)
+                self.assertIn("*** CONTAMINATED ***", report)
+
+                # Mismatch annotation
+                self.assertIn("MISMATCH", report)
+                self.assertIn("Bearer tokenB", report)     # client-1's intended value
+                self.assertIn("inserted_by=client-0", report)
+                self.assertIn("name_match_reuse", report)
+                self.assertIn("cross_client_insertion", report)
+
+                # Backend-received section flags the change
+                self.assertIn("DIFFERS FROM INTENDED", report)
+
+                # Discrepancies block
+                self.assertIn("Discrepancies:", report)
+                self.assertIn("authorization", report)
+                self.assertIn("root_cause:", report)
+
+                # Verify RequestRecord objects directly
+                records = proxy.instrumentation.request_records
+                self.assertEqual(len(records), 2)
+
+                rec_a = records[0]
+                self.assertEqual(rec_a.client_id, "client-0")
+                self.assertFalse(rec_a.is_contaminated())
+                self.assertIsNotNone(rec_a.backend_headers)
+                self.assertEqual(rec_a.compute_discrepancies(), [])
+
+                rec_b = records[1]
+                self.assertEqual(rec_b.client_id, "client-1")
+                self.assertTrue(rec_b.is_contaminated())
+                self.assertIsNotNone(rec_b.backend_headers)
+                discs = rec_b.compute_discrepancies()
+                self.assertEqual(len(discs), 1)
+                self.assertEqual(discs[0]["name"], "authorization")
+                self.assertEqual(discs[0]["intended"], "Bearer tokenB")
+                self.assertEqual(discs[0]["backend"], "Bearer tokenA")
+                self.assertIn("name_match_reuse", discs[0]["root_cause"])
+
             finally:
                 client_a.close()
                 client_b.close()
