@@ -24,7 +24,10 @@ from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.connection import QuicConnection
 from aioquic.quic.events import ProtocolNegotiated, QuicEvent
 
-from research.faulty_proxy import FaultyProxy, InsertionEvent, ReferenceEvent
+from research.faulty_proxy import (
+    EvictionEvent, FaultyProxy, InsertionEvent, ProxyInstrumentation,
+    ReferenceEvent, _SharedQpackReencoder,
+)
 
 P = ParamSpec("P")
 
@@ -651,3 +654,83 @@ class FaultyProxyTest(TestCase):
         finally:
             proxy.stop()
             echo_server.close()
+
+    def test_eviction_tracked_on_overflow(self):
+        """EvictionEvent is recorded when a new insertion evicts an older entry.
+
+        Unit test: calls _SharedQpackReencoder.encode_request() directly to avoid
+        network-layer QPACK blocking complications.
+
+        Entry sizes (name + value + 32 overhead):
+          x-foo: bar  →  5 + 3 + 32 = 40 bytes
+          x-baz: qux  →  5 + 3 + 32 = 40 bytes
+        With capacity=60: first entry fits (40 ≤ 60); second needs 80 > 60 → evict first.
+        """
+        CAPACITY = 60
+        instr = ProxyInstrumentation(mode="insert_all", capacity=CAPACITY)
+        enc = _SharedQpackReencoder("insert_all", desired_capacity=CAPACITY,
+                                    instrumentation=instr)
+        enc.initialize(4096)  # simulate backend SETTINGS with large max
+
+        base_headers = [
+            (b":method", b"GET"), (b":scheme", b"https"),
+            (b":authority", b"localhost"), (b":path", b"/"),
+        ]
+
+        # Request 0 — client-0 inserts x-foo:bar (fits, no eviction)
+        enc.encode_request(base_headers + [(b"x-foo", b"bar")], "client-0")
+        self.assertEqual(len(instr.eviction_events), 0)
+
+        # Request 1 — client-1 inserts x-baz:qux (evicts x-foo:bar)
+        enc.encode_request(base_headers + [(b"x-baz", b"qux")], "client-1")
+
+        evictions = instr.eviction_events
+        self.assertEqual(
+            len(evictions), 1,
+            f"Expected 1 eviction, got {len(evictions)}: "
+            f"{[(e.evicted_name, e.evicted_value) for e in evictions]}",
+        )
+        ev = evictions[0]
+        self.assertIsInstance(ev, EvictionEvent)
+        self.assertEqual(ev.evicted_name, b"x-foo")
+        self.assertEqual(ev.evicted_value, b"bar")
+        self.assertEqual(ev.evicted_inserted_by, "client-0")
+        self.assertEqual(ev.triggered_by_client_id, "client-1")
+        self.assertEqual(ev.triggered_by_request_id, 1)
+
+        # The eviction event should appear on the triggering request's record
+        records = instr.request_records
+        self.assertEqual(len(records), 2)
+        self.assertEqual(records[0].evictions, [])   # client-0's request caused no eviction
+        self.assertEqual(len(records[1].evictions), 1)
+        self.assertEqual(records[1].evictions[0].evicted_name, b"x-foo")
+
+    def test_eviction_report_section(self):
+        """generate_report() shows eviction count in the summary and per-request detail.
+
+        Unit test: exercises report generation without any network stack.
+        """
+        CAPACITY = 60
+        instr = ProxyInstrumentation(mode="insert_all", capacity=CAPACITY)
+        enc = _SharedQpackReencoder("insert_all", desired_capacity=CAPACITY,
+                                    instrumentation=instr)
+        enc.initialize(4096)
+
+        base_headers = [
+            (b":method", b"GET"), (b":scheme", b"https"),
+            (b":authority", b"localhost"), (b":path", b"/"),
+        ]
+        enc.encode_request(base_headers + [(b"x-foo", b"bar")], "client-0")
+        enc.encode_request(base_headers + [(b"x-baz", b"qux")], "client-1")
+
+        report = instr.generate_report()
+
+        # Summary line should count the eviction
+        self.assertIn("Evictions: 1", report)
+        # Eviction detail: header name, owner, and keyword
+        self.assertIn("EVICTED", report)
+        self.assertIn("x-foo", report)
+        self.assertIn("client-0", report)  # evicted_inserted_by
+        # Capacity and mode in header
+        self.assertIn("insert_all", report)
+        self.assertIn("60", report)

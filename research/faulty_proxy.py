@@ -35,7 +35,7 @@ from aioquic.quic.connection import QuicConnection
 from aioquic.quic.events import ProtocolNegotiated, QuicEvent
 
 from .qpack_static_table import STATIC_TABLE
-from .qpack_manual import ManualQpackEncoder, encode_integer
+from .qpack_manual import ENTRY_OVERHEAD, ManualQpackEncoder, encode_integer
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +67,18 @@ class ReferenceEvent:
 
 
 @dataclass
+class EvictionEvent:
+    """Recorded when inserting a new entry evicts an older one from the shared table."""
+
+    evicted_name: bytes
+    evicted_value: bytes
+    evicted_abs_index: int       # absolute table index of the evicted entry
+    evicted_inserted_by: str     # client_id that originally inserted it
+    triggered_by_client_id: str  # client_id whose insertion caused this eviction
+    triggered_by_request_id: int = -1
+
+
+@dataclass
 class RequestRecord:
     """Complete record of a single forwarded request.
 
@@ -83,6 +95,7 @@ class RequestRecord:
     backend_headers: Optional[list[tuple[bytes, bytes]]] = None
     insertions: list = field(default_factory=list)   # list[InsertionEvent]
     references: list = field(default_factory=list)   # list[ReferenceEvent]
+    evictions: list = field(default_factory=list)    # list[EvictionEvent]
 
     def is_contaminated(self) -> bool:
         """True if any dynamic-table reference resolved to a wrong value."""
@@ -145,6 +158,8 @@ class ProxyInstrumentation:
     def __init__(self, mode: str = "", capacity: int = 0) -> None:
         # Flat event log — preserved for backward compatibility with existing tests
         self.events: list[InsertionEvent | ReferenceEvent] = []
+        # All eviction events in order
+        self._evictions: list[EvictionEvent] = []
         # Per-request structured records
         self._requests: list[RequestRecord] = []
         self._next_id: int = 0
@@ -209,6 +224,27 @@ class ProxyInstrumentation:
         if 0 <= request_id < len(self._requests):
             self._requests[request_id].references.append(ev)
 
+    def record_eviction(
+        self,
+        evicted_name: bytes,
+        evicted_value: bytes,
+        evicted_abs_index: int,
+        evicted_inserted_by: str,
+        triggered_by_client_id: str,
+        triggered_by_request_id: int = -1,
+    ) -> None:
+        ev = EvictionEvent(
+            evicted_name=evicted_name,
+            evicted_value=evicted_value,
+            evicted_abs_index=evicted_abs_index,
+            evicted_inserted_by=evicted_inserted_by,
+            triggered_by_client_id=triggered_by_client_id,
+            triggered_by_request_id=triggered_by_request_id,
+        )
+        self._evictions.append(ev)
+        if 0 <= triggered_by_request_id < len(self._requests):
+            self._requests[triggered_by_request_id].evictions.append(ev)
+
     def record_backend_response(
         self,
         client_id: str,
@@ -232,8 +268,14 @@ class ProxyInstrumentation:
         """All per-request records, in forwarding order."""
         return list(self._requests)
 
+    @property
+    def eviction_events(self) -> list[EvictionEvent]:
+        """All eviction events in the order they occurred."""
+        return list(self._evictions)
+
     def clear(self) -> None:
         self.events.clear()
+        self._evictions.clear()
         self._requests.clear()
         self._next_id = 0
         self._pending_backend.clear()
@@ -259,6 +301,7 @@ class ProxyInstrumentation:
         n_total = len(self._requests)
         n_contaminated = sum(1 for r in self._requests if r.is_contaminated())
         n_clean = n_total - n_contaminated
+        n_evictions = len(self._evictions)
         has_backend = any(r.backend_headers is not None for r in self._requests)
 
         lines: list[str] = []
@@ -270,7 +313,7 @@ class ProxyInstrumentation:
             )
         lines.append(
             f"  Requests: {n_total}  |  Contaminated: {n_contaminated}"
-            f"  |  Clean: {n_clean}"
+            f"  |  Clean: {n_clean}  |  Evictions: {n_evictions}"
         )
         if n_total > 0 and not has_backend:
             lines.append(
@@ -363,6 +406,19 @@ class ProxyInstrumentation:
                         )
                 else:
                     lines.append("  Diff: no discrepancies")
+
+            # ── Evictions caused by this request ─────────────────────────
+            if rec.evictions:
+                lines.append("")
+                lines.append("  Evictions caused by this request:")
+                for ev in rec.evictions:
+                    en = ev.evicted_name.decode(errors="replace")
+                    ev_ = ev.evicted_value.decode(errors="replace")
+                    lines.append(
+                        f"    EVICTED abs={ev.evicted_abs_index}"
+                        f"  {en}: {ev_!r}"
+                        f"  (was inserted by {ev.evicted_inserted_by or 'unknown'})"
+                    )
             lines.append("")
 
         return "\n".join(lines)
@@ -432,9 +488,10 @@ class _SharedQpackReencoder:
         # Initialized with max_table_capacity=0; updated when backend SETTINGS arrive.
         self._encoder = ManualQpackEncoder(max_table_capacity=desired_capacity)
         self._initialized = False
-        # Tracks which client last inserted each header name — used for root-cause
-        # classification when a reference resolves to a mismatched value.
-        self._inserted_by: dict[bytes, str] = {}
+        # Parallel list to self._encoder.table.entries:
+        #   _entry_owners[i] = (abs_index, client_id) for table.entries[i].
+        # Index 0 = newest entry; updated on every insert/eviction.
+        self._entry_owners: list[tuple[int, str]] = []
 
     def initialize(self, peer_max_capacity: int) -> bytes:
         """Called when backend SETTINGS arrive. Sets the actual table capacity.
@@ -471,11 +528,10 @@ class _SharedQpackReencoder:
                     continue  # already in static table, no need to insert
                 if self._dynamic_by_name(name) is not None:
                     continue  # name already in table — reuse it (the flaw)
-                instr = self._try_insert(name, value)
+                instr = self._try_insert(name, value, client_id, request_id)
                 if instr:
                     encoder_instructions.extend(instr)
                     abs_idx = self._encoder.table.insert_count - 1
-                    self._inserted_by[name] = client_id
                     self._instrumentation.record_insertion(
                         client_id, abs_idx, name, value, request_id=request_id
                     )
@@ -486,11 +542,10 @@ class _SharedQpackReencoder:
                     continue
                 if self._static_exact(name, value) is not None:
                     continue
-                instr = self._try_insert(name, value)
+                instr = self._try_insert(name, value, client_id, request_id)
                 if instr:
                     encoder_instructions.extend(instr)
                     abs_idx = self._encoder.table.insert_count - 1
-                    self._inserted_by[name] = client_id
                     self._instrumentation.record_insertion(
                         client_id, abs_idx, name, value, request_id=request_id
                     )
@@ -506,7 +561,7 @@ class _SharedQpackReencoder:
                 dyn = self._dynamic_by_name(name)
                 if dyn is not None:
                     rel_idx, stored_value = dyn
-                    inserter = self._inserted_by.get(name, "")
+                    inserter = self._get_inserter_by_name(name)
                     contaminated = stored_value != value
                     if contaminated:
                         causes = []
@@ -537,22 +592,88 @@ class _SharedQpackReencoder:
     # Private helpers
     # ------------------------------------------------------------------
 
-    def _try_insert(self, name: bytes, value: bytes) -> Optional[bytes]:
+    def _try_insert(
+        self, name: bytes, value: bytes, client_id: str, request_id: int
+    ) -> Optional[bytes]:
         """Attempt to insert (name, value) into the dynamic table.
 
+        Detects which existing entries will be evicted, records EvictionEvents,
+        updates _entry_owners, then performs the actual insert.
         Prefers insert_name_ref if the name is in the static table.
-        Returns the wire-format instruction bytes, or None if it doesn't fit.
+        Returns wire-format instruction bytes, or None if the entry doesn't fit.
         """
-        if self._encoder.table.capacity == 0:
-            return None
+        table = self._encoder.table
+        entry_size = len(name) + len(value) + ENTRY_OVERHEAD
+        if entry_size > table.capacity:
+            return None  # can never fit, even with a fully empty table
+
+        # Predict which existing entries will be evicted
+        evictions = self._predict_evictions(entry_size)
+
         try:
             static_idx = self._static_name_only(name)
             if static_idx is not None:
-                return self._encoder.insert_name_ref(static_idx, value, is_static=True)
+                instr = self._encoder.insert_name_ref(static_idx, value, is_static=True)
             else:
-                return self._encoder.insert_literal(name, value)
+                instr = self._encoder.insert_literal(name, value)
         except ValueError:
-            return None  # entry too large for current capacity
+            return None  # unexpected; safety net
+
+        new_abs = table.insert_count - 1
+
+        # Record eviction events and trim _entry_owners from the tail
+        for ev_abs, ev_name, ev_value, ev_by in evictions:
+            self._instrumentation.record_eviction(
+                evicted_name=ev_name,
+                evicted_value=ev_value,
+                evicted_abs_index=ev_abs,
+                evicted_inserted_by=ev_by,
+                triggered_by_client_id=client_id,
+                triggered_by_request_id=request_id,
+            )
+        for _ in evictions:
+            self._entry_owners.pop()
+
+        # Prepend new entry to _entry_owners (index 0 = newest)
+        self._entry_owners.insert(0, (new_abs, client_id))
+
+        return instr
+
+    def _predict_evictions(
+        self, entry_size: int
+    ) -> list[tuple[int, bytes, bytes, str]]:
+        """Return metadata for entries that will be evicted by inserting entry_size bytes.
+
+        Returns list of (abs_index, name, value, client_id) in eviction order
+        (oldest first), matching the order DynamicTableTracker.insert() evicts them.
+        """
+        table = self._encoder.table
+        needed = table.current_size() + entry_size - table.capacity
+        if needed <= 0:
+            return []
+        to_evict: list[tuple[int, bytes, bytes, str]] = []
+        freed = 0
+        for i in range(len(table.entries) - 1, -1, -1):
+            e = table.entries[i]
+            if i < len(self._entry_owners):
+                abs_idx, owner = self._entry_owners[i]
+            else:
+                abs_idx, owner = -1, ""
+            to_evict.append((abs_idx, e.name, e.value, owner))
+            freed += e.size
+            if freed >= needed:
+                break
+        return to_evict
+
+    def _get_inserter_by_name(self, name: bytes) -> str:
+        """Return the client_id that inserted the dynamic table entry currently
+        matching the given name (first/newest match)."""
+        for i, entry in enumerate(self._encoder.table.entries):
+            if entry.name == name:
+                if i < len(self._entry_owners):
+                    return self._entry_owners[i][1]
+                return ""
+        return ""
 
     def _static_exact(self, name: bytes, value: bytes) -> Optional[int]:
         """Return the 0-based static table index for an exact (name, value) match."""
