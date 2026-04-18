@@ -1,19 +1,18 @@
-"""FaultyProxy — HTTP/3 reverse proxy with a shared QPACK re-encoder.
+"""PooledProxy — HTTP/3 reverse proxy with a shared QPACK backend encoder.
 
 The proxy maintains a *single* ManualQpackEncoder for all backend requests.
-Every forwarded request header block is re-encoded using this shared encoder,
-enabling cross-client dynamic table contamination (the vulnerability).
+Headers are re-encoded using RFC 9204-compliant rules:
 
-Two encoding modes:
+  - Exact (name, value) match in static table  → §4.5.2 static indexed ref
+  - Exact (name, value) match in dynamic table → §4.5.2 dynamic indexed ref, no insert
+  - Name match but value differs               → insert new entry via §4.3.2 name ref,
+                                                  then §4.5.2 indexed ref to new entry
+  - No match anywhere                          → insert via §4.3.3 literal, then §4.5.2
 
-  naive_name_reuse — Phase 1: insert a header only when its *name* is not yet
-                     in the dynamic table. Phase 2: reference by name, ignoring
-                     whose value is stored. This causes value leakage between
-                     clients as soon as two clients send the same header name.
-
-  insert_all       — Phase 1: always insert every non-static header. Phase 2:
-                     reference by name (picks most-recent). Useful for forced
-                     eviction scenarios.
+This means three distinct table outcomes are possible per request pair:
+  1. Different names   — two independent literal inserts, two entries
+  2. Same name, different value — name-ref insert, two entries with shared name
+  3. Same name, same value — no insert, indexed ref to existing entry (observable)
 """
 
 from __future__ import annotations
@@ -52,6 +51,7 @@ class InsertionEvent:
     name: bytes
     value: bytes
     request_id: int = -1
+    kind: str = "literal"  # "literal", "static_name_ref", or "dynamic_name_ref"
 
 
 @dataclass
@@ -155,7 +155,7 @@ class ProxyInstrumentation:
         print(proxy.instrumentation.generate_report())
     """
 
-    def __init__(self, mode: str = "", capacity: int = 0) -> None:
+    def __init__(self, capacity: int = 0) -> None:
         # Flat event log — preserved for backward compatibility with existing tests
         self.events: list[InsertionEvent | ReferenceEvent] = []
         # All eviction events in order
@@ -165,7 +165,6 @@ class ProxyInstrumentation:
         self._next_id: int = 0
         # FIFO queues: client_id → request_ids waiting for backend headers
         self._pending_backend: dict[str, deque[int]] = {}
-        self._mode = mode
         self._capacity = capacity
 
     # ------------------------------------------------------------------
@@ -195,10 +194,11 @@ class ProxyInstrumentation:
         name: bytes,
         value: bytes,
         request_id: int = -1,
+        kind: str = "literal",
     ) -> None:
         ev = InsertionEvent(
             client_id=client_id, abs_index=abs_index,
-            name=name, value=value, request_id=request_id,
+            name=name, value=value, request_id=request_id, kind=kind,
         )
         self.events.append(ev)
         if 0 <= request_id < len(self._requests):
@@ -306,11 +306,9 @@ class ProxyInstrumentation:
 
         lines: list[str] = []
         lines.append("=" * W)
-        lines.append("FAULTY PROXY REPORT")
-        if self._mode:
-            lines.append(
-                f"  Mode: {self._mode}  |  Table capacity: {self._capacity} bytes"
-            )
+        lines.append("POOLED PROXY REPORT")
+        if self._capacity:
+            lines.append(f"  Table capacity: {self._capacity} bytes")
         lines.append(
             f"  Requests: {n_total}  |  Contaminated: {n_contaminated}"
             f"  |  Clean: {n_clean}  |  Evictions: {n_evictions}"
@@ -467,22 +465,20 @@ class _EncoderProxy:
 
 
 class _SharedQpackReencoder:
-    """Shared QPACK encoder for all backend requests.
+    """Shared RFC-compliant QPACK re-encoder for all backend requests.
 
-    A single ManualQpackEncoder is used for ALL clients. When multiple clients
-    send headers with the same name, the shared dynamic table causes value
-    leakage: one client's value is referenced in another client's header block.
+    A single ManualQpackEncoder is used for ALL clients. Encoding follows
+    RFC 9204 rules: insert when no exact match exists (using a name reference
+    if the name is already in the table), then emit an indexed field line.
+    Exact matches across clients result in no new insertion — observable as
+    the oracle signal for Case 3.
     """
 
     def __init__(
         self,
-        mode: str,
         desired_capacity: int,
         instrumentation: ProxyInstrumentation,
     ) -> None:
-        if mode not in ("naive_name_reuse", "insert_all"):
-            raise ValueError(f"Unknown mode: {mode!r}")
-        self._mode = mode
         self._desired_capacity = desired_capacity
         self._instrumentation = instrumentation
         # Initialized with max_table_capacity=0; updated when backend SETTINGS arrive.
@@ -520,37 +516,30 @@ class _SharedQpackReencoder:
         encoder_instructions = bytearray()
 
         # ── Phase 1: insertions ──────────────────────────────────────────
-        if self._mode == "naive_name_reuse":
-            for name, value in headers:
-                if name.startswith(b":"):
-                    continue  # pseudo-headers: never insert
-                if self._static_exact(name, value) is not None:
-                    continue  # already in static table, no need to insert
-                if self._dynamic_by_name(name) is not None:
-                    continue  # name already in table — reuse it (the flaw)
-                instr = self._try_insert(name, value, client_id, request_id)
-                if instr:
-                    encoder_instructions.extend(instr)
-                    abs_idx = self._encoder.table.insert_count - 1
-                    self._instrumentation.record_insertion(
-                        client_id, abs_idx, name, value, request_id=request_id
-                    )
-
-        elif self._mode == "insert_all":
-            for name, value in headers:
-                if name.startswith(b":"):
-                    continue
-                if self._static_exact(name, value) is not None:
-                    continue
-                instr = self._try_insert(name, value, client_id, request_id)
-                if instr:
-                    encoder_instructions.extend(instr)
-                    abs_idx = self._encoder.table.insert_count - 1
-                    self._instrumentation.record_insertion(
-                        client_id, abs_idx, name, value, request_id=request_id
-                    )
+        # Insert a new entry whenever the exact (name, value) pair is not already
+        # in the table.  Use a name-reference instruction (§4.3.2) if the name
+        # exists anywhere (static or dynamic), otherwise a literal insert (§4.3.3).
+        # This minimises encoder-stream bandwidth and produces the three distinct
+        # table outcomes described in the module docstring.
+        for name, value in headers:
+            if name.startswith(b":"):
+                continue  # pseudo-headers are never inserted
+            if self._static_exact(name, value) is not None:
+                continue  # exact static match — no dynamic insert needed
+            if self._dynamic_exact(name, value) is not None:
+                continue  # exact dynamic match already present — will ref in Phase 2
+            instr, kind = self._try_insert(name, value, client_id, request_id)
+            if instr:
+                encoder_instructions.extend(instr)
+                abs_idx = self._encoder.table.insert_count - 1
+                self._instrumentation.record_insertion(
+                    client_id, abs_idx, name, value,
+                    request_id=request_id, kind=kind,
+                )
 
         # ── Phase 2: build header block ──────────────────────────────────
+        # After Phase 1 every header has an exact match in either the static or
+        # dynamic table (unless the entry was too large to fit, handled below).
         header_entries = []
         has_dynamic = False
         for name, value in headers:
@@ -558,30 +547,26 @@ class _SharedQpackReencoder:
             if static_idx is not None:
                 header_entries.append(("static", static_idx, name, value))
             else:
-                dyn = self._dynamic_by_name(name)
-                if dyn is not None:
-                    rel_idx, stored_value = dyn
+                dyn_idx = self._dynamic_exact(name, value)
+                if dyn_idx is not None:
                     inserter = self._get_inserter_by_name(name)
-                    contaminated = stored_value != value
-                    if contaminated:
-                        causes = []
-                        if self._mode == "naive_name_reuse":
-                            causes.append("name_match_reuse")
-                        if inserter and inserter != client_id:
-                            causes.append("cross_client_insertion")
-                        root_cause = ", ".join(causes) if causes else "unknown"
-                    else:
-                        root_cause = "clean"
                     self._instrumentation.record_reference(
-                        client_id, rel_idx, name, stored_value, value,
+                        client_id, dyn_idx, name, value, value,
                         request_id=request_id,
                         inserted_by=inserter,
-                        root_cause=root_cause,
+                        root_cause="clean",
                     )
-                    header_entries.append(("dynamic", rel_idx, name, stored_value))
+                    header_entries.append(("dynamic", dyn_idx, name, value))
                     has_dynamic = True
                 else:
-                    header_entries.append(("literal", 0, name, value))
+                    # Entry was too large to insert; fall back to a name ref or literal.
+                    static_name_idx = self._static_name_only(name)
+                    if static_name_idx is not None:
+                        header_entries.append(
+                            ("static_name_ref", static_name_idx, name, value)
+                        )
+                    else:
+                        header_entries.append(("literal", 0, name, value))
 
         ric = self._encoder.table.insert_count if has_dynamic else 0
         header_block = self._build_header_block(header_entries, ric)
@@ -594,30 +579,41 @@ class _SharedQpackReencoder:
 
     def _try_insert(
         self, name: bytes, value: bytes, client_id: str, request_id: int
-    ) -> Optional[bytes]:
+    ) -> tuple[Optional[bytes], str]:
         """Attempt to insert (name, value) into the dynamic table.
 
-        Detects which existing entries will be evicted, records EvictionEvents,
-        updates _entry_owners, then performs the actual insert.
-        Prefers insert_name_ref if the name is in the static table.
-        Returns wire-format instruction bytes, or None if the entry doesn't fit.
+        Chooses the most efficient instruction:
+          - §4.3.2 with S=1 if name is in the static table
+          - §4.3.2 with S=0 if name is in the dynamic table
+          - §4.3.3 literal otherwise
+
+        Detects evictions, records EvictionEvents, updates _entry_owners.
+        Returns (wire-format instruction bytes, kind) or (None, "") if the
+        entry is too large to ever fit.
         """
         table = self._encoder.table
         entry_size = len(name) + len(value) + ENTRY_OVERHEAD
         if entry_size > table.capacity:
-            return None  # can never fit, even with a fully empty table
+            return None, ""  # can never fit, even with a fully empty table
 
         # Predict which existing entries will be evicted
         evictions = self._predict_evictions(entry_size)
 
         try:
             static_idx = self._static_name_only(name)
+            dyn_result = self._dynamic_by_name(name)
             if static_idx is not None:
                 instr = self._encoder.insert_name_ref(static_idx, value, is_static=True)
+                kind = "static_name_ref"
+            elif dyn_result is not None:
+                rel_idx, _ = dyn_result
+                instr = self._encoder.insert_name_ref(rel_idx, value, is_static=False)
+                kind = "dynamic_name_ref"
             else:
                 instr = self._encoder.insert_literal(name, value)
+                kind = "literal"
         except ValueError:
-            return None  # unexpected; safety net
+            return None, ""  # unexpected; safety net
 
         new_abs = table.insert_count - 1
 
@@ -637,7 +633,7 @@ class _SharedQpackReencoder:
         # Prepend new entry to _entry_owners (index 0 = newest)
         self._entry_owners.insert(0, (new_abs, client_id))
 
-        return instr
+        return instr, kind
 
     def _predict_evictions(
         self, entry_size: int
@@ -674,6 +670,13 @@ class _SharedQpackReencoder:
                     return self._entry_owners[i][1]
                 return ""
         return ""
+
+    def _dynamic_exact(self, name: bytes, value: bytes) -> Optional[int]:
+        """Return relative_index for an exact (name, value) match in the dynamic table."""
+        for i, entry in enumerate(self._encoder.table.entries):
+            if entry.name == name and entry.value == value:
+                return i
+        return None
 
     def _static_exact(self, name: bytes, value: bytes) -> Optional[int]:
         """Return the 0-based static table index for an exact (name, value) match."""
@@ -745,6 +748,28 @@ class _SharedQpackReencoder:
                 b = bytearray(encode_integer(rel_idx, 6))
                 b[0] |= 0x80  # T=0, pre-base indexed field line
                 buf.extend(b)
+
+            elif kind == "static_name_ref":
+                idx = arg
+                # Literal Field Line with Name Reference, S=1 (static), N=0
+                # RFC 9204 §4.5.4 — bits: 0 1 N=0 S=1 [4-bit Name Index]
+                b = bytearray(encode_integer(idx, 4))
+                b[0] |= 0x50
+                buf.extend(b)
+                val_len_b = encode_integer(len(value), 7)
+                buf.extend(val_len_b)
+                buf.extend(value)
+
+            elif kind == "dyn_name_ref":
+                rel_idx = arg
+                # Literal Field Line with Name Reference, S=0 (dynamic), N=0
+                # RFC 9204 §4.5.4 — bits: 0 1 N=0 S=0 [4-bit Name Index]
+                b = bytearray(encode_integer(rel_idx, 4))
+                b[0] |= 0x40
+                buf.extend(b)
+                val_len_b = encode_integer(len(value), 7)
+                buf.extend(val_len_b)
+                buf.extend(value)
 
             else:  # "literal"
                 # Literal Field Line with Literal Name (RFC 9204 §4.5.6)
@@ -1005,29 +1030,24 @@ class _FrontendProtocol(QuicConnectionProtocol):
 
 
 class FaultyProxy:
-    """HTTP/3 reverse proxy with a shared QPACK re-encoder (the vulnerability).
+    """HTTP/3 reverse proxy with a shared QPACK backend encoder.
 
     All frontend clients share a single backend H3 connection with a single
-    QPACK encoder. Forwarded headers are re-encoded using that shared table,
-    enabling cross-client dynamic table contamination.
+    RFC-compliant QPACK encoder.  Forwarded headers are re-encoded using the
+    shared dynamic table; the three possible table outcomes per request pair
+    are described in the module docstring.
 
     Args:
-        mode: ``"naive_name_reuse"`` (primary attack) or ``"insert_all"``.
         table_capacity: Desired dynamic table capacity in bytes.
     """
 
     def __init__(
         self,
-        mode: str = "naive_name_reuse",
         table_capacity: int = 4096,
     ) -> None:
-        if mode not in ("naive_name_reuse", "insert_all"):
-            raise ValueError(f"mode must be 'naive_name_reuse' or 'insert_all', got {mode!r}")
-        self._mode = mode
         self._table_capacity = table_capacity
-        self._instrumentation = ProxyInstrumentation(mode=mode, capacity=table_capacity)
+        self._instrumentation = ProxyInstrumentation(capacity=table_capacity)
         self._shared_qpack = _SharedQpackReencoder(
-            mode=mode,
             desired_capacity=table_capacity,
             instrumentation=self._instrumentation,
         )
@@ -1090,10 +1110,6 @@ class FaultyProxy:
         return self._port
 
     @property
-    def mode(self) -> str:
-        return self._mode
-
-    @property
     def instrumentation(self) -> ProxyInstrumentation:
         return self._instrumentation
 
@@ -1133,5 +1149,5 @@ class FaultyProxy:
         protocol.connect(self._backend_addr)
         await protocol.wait_ready()
 
-        logger.info("[proxy] Backend connection ready (mode=%s)", self._mode)
+        logger.info("[proxy] Backend connection ready")
         return protocol

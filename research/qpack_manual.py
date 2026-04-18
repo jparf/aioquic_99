@@ -197,6 +197,65 @@ def parse_decoder_stream(data: bytes) -> list[tuple[str, int]]:
     return instructions
 
 
+def _decode_string(data: bytes, offset: int) -> tuple[bytes, int]:
+    """Decode a QPACK length-prefixed string (7-bit prefix, Huffman flag ignored).
+
+    Returns (raw_bytes, bytes_consumed).  Huffman-encoded strings are returned
+    as raw bytes without decoding — sufficient for display purposes.
+    """
+    if offset >= len(data):
+        raise ValueError("offset beyond data length")
+    length, consumed = decode_integer(data, offset, 7)
+    end = offset + consumed + length
+    if end > len(data):
+        raise ValueError("string extends beyond data")
+    return data[offset + consumed:end], consumed + length
+
+
+def parse_encoder_stream(data: bytes) -> list[tuple]:
+    """Parse QPACK encoder stream bytes into a list of instructions.
+
+    Returns a list of tuples, one per instruction:
+      ("set_capacity",    capacity: int)
+      ("insert_name_ref", index: int, is_static: bool, value: bytes)
+      ("insert_literal",  name: bytes, value: bytes)
+      ("duplicate",       index: int)
+    """
+    instructions: list[tuple] = []
+    offset = 0
+    while offset < len(data):
+        byte = data[offset]
+        if byte & 0x80:
+            # Insert With Name Reference: 1 S xxxxxx
+            is_static = bool(byte & 0x40)
+            index, consumed = decode_integer(data, offset, 6)
+            offset += consumed
+            value, vconsumed = _decode_string(data, offset)
+            offset += vconsumed
+            instructions.append(("insert_name_ref", index, is_static, value))
+        elif byte & 0x40:
+            # Insert With Literal Name: 01 H xxxxx
+            # Bit 6 = opcode, bit 5 = Huffman flag, bits 4-0 = 5-bit name length prefix.
+            name_len, consumed = decode_integer(data, offset, 5)
+            offset += consumed
+            name = data[offset:offset + name_len]
+            offset += name_len
+            value, vconsumed = _decode_string(data, offset)
+            offset += vconsumed
+            instructions.append(("insert_literal", name, value))
+        elif byte & 0x20:
+            # Set Dynamic Table Capacity: 001 xxxxx
+            capacity, consumed = decode_integer(data, offset, 5)
+            offset += consumed
+            instructions.append(("set_capacity", capacity))
+        else:
+            # Duplicate: 000 xxxxx
+            index, consumed = decode_integer(data, offset, 5)
+            offset += consumed
+            instructions.append(("duplicate", index))
+    return instructions
+
+
 def print_decoder_log(decoder_log: list[bytes]) -> None:
     """Parse and print decoder stream ack log in human-readable form."""
     all_data = b"".join(decoder_log)

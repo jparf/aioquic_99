@@ -41,6 +41,8 @@ from aioquic.h3.events import DataReceived, H3Event, HeadersReceived
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.events import ProtocolNegotiated, QuicEvent
 
+from .qpack_manual import parse_decoder_stream, parse_encoder_stream
+
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -77,6 +79,114 @@ class RequestRecord:
 
 
 # ---------------------------------------------------------------------------
+# QPACK decoder stream ack capture
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class EncStreamRecord:
+    """One batch of QPACK encoder stream bytes received by the server.
+
+    Each record corresponds to one ``feed_encoder`` call from H3Connection —
+    i.e., one chunk of encoder stream data arriving from the proxy.
+    ``instructions`` is the parsed form of ``raw_bytes``.
+    """
+    seq: int
+    raw_bytes: bytes
+    instructions: list[tuple]
+
+
+@dataclass
+class AckRecord:
+    """One batch of QPACK decoder stream bytes sent by the server.
+
+    Each record corresponds to one ``feed_header`` call — i.e., one header
+    block being decoded.  ``instructions`` is the parsed form of ``raw_bytes``.
+    """
+    seq: int
+    raw_bytes: bytes
+    instructions: list[tuple[str, int]]
+
+
+class _EncoderStreamCapture:
+    """Wraps pylsqpack.Decoder to log data received on the QPACK encoder stream.
+
+    ``feed_encoder`` is called by H3Connection whenever encoder stream bytes
+    arrive from the peer (the proxy).  We record the raw bytes and their
+    parsed instruction form before forwarding to the real decoder.
+    """
+
+    def __init__(self, real: Any, enc_log: list[EncStreamRecord]) -> None:
+        object.__setattr__(self, "_real", real)
+        object.__setattr__(self, "_enc_log", enc_log)
+        object.__setattr__(self, "_seq", [0])
+
+    def feed_encoder(self, data: bytes):
+        if data:
+            seq = self._seq[0]
+            self._seq[0] += 1
+            self._enc_log.append(EncStreamRecord(
+                seq=seq,
+                raw_bytes=data,
+                instructions=parse_encoder_stream(data),
+            ))
+        return self._real.feed_encoder(data)
+
+    def __getattr__(self, name: str):
+        return getattr(self._real, name)
+
+
+class _AckCapturingQuic:
+    """Wraps QuicConnection to intercept send_stream_data on the decoder stream.
+
+    Constructed after H3Connection.__init__() so _local_decoder_stream_id is
+    known.  All send_stream_data calls for that stream are captured into
+    ack_log before being forwarded to the real QuicConnection.
+    """
+
+    def __init__(self, real: Any, ack_log: list[AckRecord], decoder_sid: int) -> None:
+        object.__setattr__(self, "_real", real)
+        object.__setattr__(self, "_ack_log", ack_log)
+        object.__setattr__(self, "_dsid", decoder_sid)
+        object.__setattr__(self, "_seq", [0])
+
+    def send_stream_data(self, stream_id: int, data: bytes, end_stream: bool = False):
+        if data and stream_id == self._dsid:
+            seq = self._seq[0]
+            self._seq[0] += 1
+            self._ack_log.append(AckRecord(
+                seq=seq,
+                raw_bytes=data,
+                instructions=parse_decoder_stream(data),
+            ))
+        return self._real.send_stream_data(stream_id, data, end_stream)
+
+    def __getattr__(self, name: str):
+        return getattr(self._real, name)
+
+
+class _AckLoggingH3Connection(H3Connection):
+    """H3Connection that logs QPACK encoder and decoder stream activity.
+
+    After super().__init__() completes:
+    - self._quic is wrapped with _AckCapturingQuic to log decoder stream
+      writes (Section Acknowledgments, Insert Count Increments going back
+      to the proxy).
+    - self._decoder is wrapped with _EncoderStreamCapture to log encoder
+      stream data received from the proxy (insertions, capacity settings).
+    """
+
+    def __init__(
+        self, quic: Any, ack_log: list[AckRecord], enc_log: list[EncStreamRecord]
+    ) -> None:
+        super().__init__(quic)
+        self._quic = _AckCapturingQuic(  # type: ignore[assignment]
+            self._quic, ack_log, self._local_decoder_stream_id
+        )
+        self._decoder = _EncoderStreamCapture(self._decoder, enc_log)  # type: ignore[assignment]
+
+
+# ---------------------------------------------------------------------------
 # Internal QUIC/H3 protocol
 # ---------------------------------------------------------------------------
 
@@ -88,6 +198,8 @@ class _EchoProtocol(QuicConnectionProtocol):
     _log: list[RequestRecord] = []
     _seq_counter: list[int] = [0]         # mutable singleton for atomic increment
     _conn_counter: list[int] = [0]        # monotonic connection counter
+    _ack_log: list[AckRecord] = []        # QPACK decoder stream writes (acks to proxy)
+    _enc_log: list[EncStreamRecord] = [] # QPACK encoder stream data from proxy
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -100,7 +212,9 @@ class _EchoProtocol(QuicConnectionProtocol):
     def quic_event_received(self, event: QuicEvent) -> None:
         if isinstance(event, ProtocolNegotiated):
             if event.alpn_protocol in H3_ALPN:
-                self._http = H3Connection(self._quic)
+                self._http = _AckLoggingH3Connection(
+                    self._quic, type(self)._ack_log, type(self)._enc_log
+                )
         if self._http is not None:
             for h3ev in self._http.handle_event(event):
                 self._on_h3_event(h3ev)
@@ -209,6 +323,8 @@ class EchoServer:
         self._log: list[RequestRecord] = []
         self._seq: list[int] = [0]
         self._conn_count: list[int] = [0]
+        self._ack_log: list[AckRecord] = []
+        self._enc_log: list[EncStreamRecord] = []
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -230,11 +346,15 @@ class EchoServer:
         log = self._log
         seq = self._seq
         conn_count = self._conn_count
+        ack_log = self._ack_log
+        enc_log = self._enc_log
 
         class _BoundProtocol(_EchoProtocol):
             _log = log           # type: ignore[assignment]
             _seq_counter = seq   # type: ignore[assignment]
             _conn_counter = conn_count  # type: ignore[assignment]
+            _ack_log = ack_log   # type: ignore[assignment]
+            _enc_log = enc_log   # type: ignore[assignment]
 
         config = QuicConfiguration(is_client=False, alpn_protocols=H3_ALPN)
         config.load_cert_chain(cert_file, key_file)
@@ -275,6 +395,22 @@ class EchoServer:
         """Reset the request log and sequence counter."""
         self._log.clear()
         self._seq[0] = 0
+
+    def get_ack_log(self) -> list[AckRecord]:
+        """Return a snapshot of all QPACK decoder stream writes sent so far."""
+        return list(self._ack_log)
+
+    def clear_ack_log(self) -> None:
+        """Reset the decoder stream ack log."""
+        self._ack_log.clear()
+
+    def get_enc_log(self) -> list[EncStreamRecord]:
+        """Return a snapshot of all QPACK encoder stream data received so far."""
+        return list(self._enc_log)
+
+    def clear_enc_log(self) -> None:
+        """Reset the encoder stream log."""
+        self._enc_log.clear()
 
     # ------------------------------------------------------------------
     # Properties
