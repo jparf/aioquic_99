@@ -488,6 +488,9 @@ class _SharedQpackReencoder:
         #   _entry_owners[i] = (abs_index, client_id) for table.entries[i].
         # Index 0 = newest entry; updated on every insert/eviction.
         self._entry_owners: list[tuple[int, str]] = []
+        # Peer's SETTINGS_QPACK_MAX_TABLE_CAPACITY — used for RFC 9204 §3.2.6
+        # MaxEntries computation (NOT the current set capacity).
+        self._peer_max_table_capacity: int = desired_capacity
 
     def initialize(self, peer_max_capacity: int) -> bytes:
         """Called when backend SETTINGS arrive. Sets the actual table capacity.
@@ -497,6 +500,9 @@ class _SharedQpackReencoder:
         """
         if peer_max_capacity:
             actual = min(self._desired_capacity, peer_max_capacity)
+            # RFC 9204 §3.2.6: MaxEntries must be computed from
+            # SETTINGS_QPACK_MAX_TABLE_CAPACITY, not the current set capacity.
+            self._peer_max_table_capacity = peer_max_capacity
         else:
             actual = 0
         self._encoder.max_table_capacity = actual
@@ -745,8 +751,12 @@ class _SharedQpackReencoder:
         if ric == 0:
             buf.extend(b"\x00\x00")
         else:
-            capacity = self._encoder.table.capacity
-            max_entries = max(1, capacity // 32)
+            # RFC 9204 §3.2.6: MaxEntries MUST use SETTINGS_QPACK_MAX_TABLE_CAPACITY
+            # (peer's advertised maximum), NOT the current set capacity.  Using the
+            # set capacity (e.g., 512) instead of SETTINGS (e.g., 4096) produces a
+            # smaller FullRange, causing encoded_ric to wrap to 1 sooner than the
+            # decoder expects, yielding DecompressionFailed.
+            max_entries = max(1, self._peer_max_table_capacity // 32)
             encoded_ric = (ric % (2 * max_entries)) + 1
             ric_bytes = bytearray(encode_integer(encoded_ric, 8))
             buf.extend(ric_bytes)
