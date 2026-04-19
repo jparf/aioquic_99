@@ -568,7 +568,24 @@ class _SharedQpackReencoder:
                     else:
                         header_entries.append(("literal", 0, name, value))
 
-        ric = self._encoder.table.insert_count if has_dynamic else 0
+        if has_dynamic:
+            insert_count = self._encoder.table.insert_count
+            # RFC 9204 §3.2.4: RIC MUST equal max referenced abs_idx + 1.
+            # entries[i] has abs_idx = insert_count - 1 - i, so the oldest
+            # referenced entry (largest i = min_arg) gives the smallest abs_idx.
+            # ric = (insert_count - 1 - min_arg) + 1 = insert_count - min_arg.
+            dyn_args = [arg for kind, arg, _, _ in header_entries if kind == "dynamic"]
+            min_arg = min(dyn_args)
+            ric = insert_count - min_arg
+            # Recompute pre-base relative indices for Base=ric (DeltaBase=0).
+            # new_rel_idx = ric - 1 - abs_idx = arg - min_arg.
+            header_entries = [
+                ("dynamic", arg - min_arg, name, value) if kind == "dynamic"
+                else (kind, arg, name, value)
+                for kind, arg, name, value in header_entries
+            ]
+        else:
+            ric = 0
         header_block = self._build_header_block(header_entries, ric)
 
         return bytes(encoder_instructions), header_block
