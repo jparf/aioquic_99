@@ -5,5 +5,7 @@
   "extraPaths": [
     "/home/josh/99/99_Final/aioquic_99/src",
     "/home/josh/99/99_Final/pylsqpack_99/src"
-  ]
+  ],
+  "reportMissingModuleSource": "none",
+  "reportMissingTypeStubs": "none"
 }
