@@ -181,7 +181,7 @@ class _AckLoggingH3Connection(H3Connection):
     ) -> None:
         super().__init__(quic)
         self._quic = _AckCapturingQuic(  # type: ignore[assignment]
-            self._quic, ack_log, self._local_decoder_stream_id
+            self._quic, ack_log, self._local_decoder_stream_id # type: ignore
         )
         self._decoder = _EncoderStreamCapture(self._decoder, enc_log)  # type: ignore[assignment]
 

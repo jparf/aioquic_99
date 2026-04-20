@@ -8,11 +8,6 @@ Headers are re-encoded using RFC 9204-compliant rules:
   - Name match but value differs               → insert new entry via §4.3.2 name ref,
                                                   then §4.5.2 indexed ref to new entry
   - No match anywhere                          → insert via §4.3.3 literal, then §4.5.2
-
-This means three distinct table outcomes are possible per request pair:
-  1. Different names   — two independent literal inserts, two entries
-  2. Same name, different value — name-ref insert, two entries with shared name
-  3. Same name, same value — no insert, indexed ref to existing entry (observable)
 """
 
 from __future__ import annotations
@@ -21,13 +16,11 @@ import asyncio
 import logging
 import socket
 import ssl
-from collections import deque
-from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from aioquic.asyncio.protocol import QuicConnectionProtocol
 from aioquic.asyncio.server import QuicServer, serve
-from aioquic.h3.connection import H3Connection, H3_ALPN, Setting
+from aioquic.h3.connection import H3Connection, H3_ALPN
 from aioquic.h3.events import DataReceived, H3Event, HeadersReceived
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.connection import QuicConnection
@@ -37,389 +30,6 @@ from .qpack_static_table import STATIC_TABLE
 from .qpack_manual import ENTRY_OVERHEAD, ManualQpackEncoder, encode_integer
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Instrumentation data classes
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class InsertionEvent:
-    client_id: str
-    abs_index: int      # absolute table index of the new entry
-    name: bytes
-    value: bytes
-    request_id: int = -1
-    kind: str = "literal"  # "literal", "static_name_ref", or "dynamic_name_ref"
-
-
-@dataclass
-class ReferenceEvent:
-    client_id: str
-    rel_index: int          # relative table index used in the header block
-    name: bytes
-    referenced_value: bytes  # value actually in the table (may differ from intended)
-    intended_value: bytes    # value the client meant to send
-    request_id: int = -1
-    inserted_by: str = ""   # client_id that last inserted this table entry
-    root_cause: str = ""    # "name_match_reuse", "cross_client_insertion", "clean", …
-
-
-@dataclass
-class EvictionEvent:
-    """Recorded when inserting a new entry evicts an older one from the shared table."""
-
-    evicted_name: bytes
-    evicted_value: bytes
-    evicted_abs_index: int       # absolute table index of the evicted entry
-    evicted_inserted_by: str     # client_id that originally inserted it
-    triggered_by_client_id: str  # client_id whose insertion caused this eviction
-    triggered_by_request_id: int = -1
-
-
-@dataclass
-class RequestRecord:
-    """Complete record of a single forwarded request.
-
-    Populated incrementally:
-    - ``intended_headers`` and encoding events are set when the proxy
-      re-encodes the request (synchronous, always present).
-    - ``backend_headers`` is set later by calling
-      ``ProxyInstrumentation.record_backend_response()``.
-    """
-
-    request_id: int
-    client_id: str
-    intended_headers: list[tuple[bytes, bytes]]
-    backend_headers: Optional[list[tuple[bytes, bytes]]] = None
-    insertions: list = field(default_factory=list)   # list[InsertionEvent]
-    references: list = field(default_factory=list)   # list[ReferenceEvent]
-    evictions: list = field(default_factory=list)    # list[EvictionEvent]
-
-    def is_contaminated(self) -> bool:
-        """True if any dynamic-table reference resolved to a wrong value."""
-        return any(
-            ev.referenced_value != ev.intended_value for ev in self.references
-        )
-
-    def compute_discrepancies(self) -> list[dict]:
-        """Compare intended vs backend non-pseudo headers.
-
-        Returns a list of dicts with keys: ``name``, ``intended``,
-        ``backend``, ``root_cause``.  Empty if no backend headers are
-        recorded or all headers match.
-        """
-        if self.backend_headers is None:
-            return []
-        intended = {
-            name: value for name, value in self.intended_headers
-            if not name.startswith(b":")
-        }
-        backend = {
-            name: value for name, value in self.backend_headers
-            if not name.startswith(b":")
-        }
-        result = []
-        for name, int_val in intended.items():
-            bk_val = backend.get(name)
-            if bk_val is not None and bk_val != int_val:
-                root_cause = "unknown"
-                for ev in self.references:
-                    if ev.name == name and ev.referenced_value != ev.intended_value:
-                        root_cause = ev.root_cause or "unknown"
-                        break
-                result.append({
-                    "name": name.decode(errors="replace"),
-                    "intended": int_val.decode(errors="replace"),
-                    "backend": bk_val.decode(errors="replace"),
-                    "root_cause": root_cause,
-                })
-        return result
-
-
-class ProxyInstrumentation:
-    """Collects QPACK encoding events and produces per-request comparison reports.
-
-    Usage pattern::
-
-        # The proxy calls these automatically during encoding:
-        #   begin_request(), record_insertion(), record_reference()
-
-        # After each request completes, supply what the backend decoded:
-        proxy.instrumentation.record_backend_response(
-            "client-0",
-            [(b"authorization", b"Bearer tokenX"), ...]
-        )
-
-        print(proxy.instrumentation.generate_report())
-    """
-
-    def __init__(self, capacity: int = 0) -> None:
-        # Flat event log — preserved for backward compatibility with existing tests
-        self.events: list[InsertionEvent | ReferenceEvent] = []
-        # All eviction events in order
-        self._evictions: list[EvictionEvent] = []
-        # Per-request structured records
-        self._requests: list[RequestRecord] = []
-        self._next_id: int = 0
-        # FIFO queues: client_id → request_ids waiting for backend headers
-        self._pending_backend: dict[str, deque[int]] = {}
-        self._capacity = capacity
-
-    # ------------------------------------------------------------------
-    # Recording API (called by _SharedQpackReencoder.encode_request)
-    # ------------------------------------------------------------------
-
-    def begin_request(
-        self, client_id: str, intended_headers: list[tuple[bytes, bytes]]
-    ) -> int:
-        """Register a new forwarded request. Returns the assigned request_id."""
-        rid = self._next_id
-        self._next_id += 1
-        self._requests.append(
-            RequestRecord(
-                request_id=rid,
-                client_id=client_id,
-                intended_headers=list(intended_headers),
-            )
-        )
-        self._pending_backend.setdefault(client_id, deque()).append(rid)
-        return rid
-
-    def record_insertion(
-        self,
-        client_id: str,
-        abs_index: int,
-        name: bytes,
-        value: bytes,
-        request_id: int = -1,
-        kind: str = "literal",
-    ) -> None:
-        ev = InsertionEvent(
-            client_id=client_id, abs_index=abs_index,
-            name=name, value=value, request_id=request_id, kind=kind,
-        )
-        self.events.append(ev)
-        if 0 <= request_id < len(self._requests):
-            self._requests[request_id].insertions.append(ev)
-
-    def record_reference(
-        self,
-        client_id: str,
-        rel_index: int,
-        name: bytes,
-        referenced_value: bytes,
-        intended_value: bytes,
-        request_id: int = -1,
-        inserted_by: str = "",
-        root_cause: str = "",
-    ) -> None:
-        ev = ReferenceEvent(
-            client_id=client_id, rel_index=rel_index, name=name,
-            referenced_value=referenced_value, intended_value=intended_value,
-            request_id=request_id, inserted_by=inserted_by, root_cause=root_cause,
-        )
-        self.events.append(ev)
-        if 0 <= request_id < len(self._requests):
-            self._requests[request_id].references.append(ev)
-
-    def record_eviction(
-        self,
-        evicted_name: bytes,
-        evicted_value: bytes,
-        evicted_abs_index: int,
-        evicted_inserted_by: str,
-        triggered_by_client_id: str,
-        triggered_by_request_id: int = -1,
-    ) -> None:
-        ev = EvictionEvent(
-            evicted_name=evicted_name,
-            evicted_value=evicted_value,
-            evicted_abs_index=evicted_abs_index,
-            evicted_inserted_by=evicted_inserted_by,
-            triggered_by_client_id=triggered_by_client_id,
-            triggered_by_request_id=triggered_by_request_id,
-        )
-        self._evictions.append(ev)
-        if 0 <= triggered_by_request_id < len(self._requests):
-            self._requests[triggered_by_request_id].evictions.append(ev)
-
-    def record_backend_response(
-        self,
-        client_id: str,
-        backend_headers: list[tuple[bytes, bytes]],
-    ) -> None:
-        """Associate backend-decoded headers with the oldest pending request for client_id.
-
-        Call this once per completed request (in order) to enable the full
-        comparison diff in ``generate_report()``.  The headers should be the
-        raw ``(name, value)`` tuples as decoded by the backend — pseudo-headers
-        are accepted but excluded from the discrepancy diff.
-        """
-        queue = self._pending_backend.get(client_id)
-        if queue:
-            rid = queue.popleft()
-            if rid < len(self._requests):
-                self._requests[rid].backend_headers = list(backend_headers)
-
-    @property
-    def request_records(self) -> list[RequestRecord]:
-        """All per-request records, in forwarding order."""
-        return list(self._requests)
-
-    @property
-    def eviction_events(self) -> list[EvictionEvent]:
-        """All eviction events in the order they occurred."""
-        return list(self._evictions)
-
-    def clear(self) -> None:
-        self.events.clear()
-        self._evictions.clear()
-        self._requests.clear()
-        self._next_id = 0
-        self._pending_backend.clear()
-
-    # ------------------------------------------------------------------
-    # Report generation
-    # ------------------------------------------------------------------
-
-    def report(self) -> str:
-        """Alias for generate_report() — backward compatible."""
-        return self.generate_report()
-
-    def generate_report(self) -> str:
-        """Produce a full human-readable comparison report.
-
-        Each request section shows:
-          - Intended headers (what the client sent to the proxy)
-          - Proxy encoding decisions (INSERTs and REFs, with mismatch flags)
-          - Backend-received headers (if ``record_backend_response`` was called)
-          - A diff highlighting every discrepancy with its root cause
-        """
-        W = 72
-        n_total = len(self._requests)
-        n_contaminated = sum(1 for r in self._requests if r.is_contaminated())
-        n_clean = n_total - n_contaminated
-        n_evictions = len(self._evictions)
-        has_backend = any(r.backend_headers is not None for r in self._requests)
-
-        lines: list[str] = []
-        lines.append("=" * W)
-        lines.append("POOLED PROXY REPORT")
-        if self._capacity:
-            lines.append(f"  Table capacity: {self._capacity} bytes")
-        lines.append(
-            f"  Requests: {n_total}  |  Contaminated: {n_contaminated}"
-            f"  |  Clean: {n_clean}  |  Evictions: {n_evictions}"
-        )
-        if n_total > 0 and not has_backend:
-            lines.append(
-                "  Note: backend headers not recorded."
-                "  Call record_backend_response() for full diff."
-            )
-        lines.append("=" * W)
-
-        for rec in self._requests:
-            status = "*** CONTAMINATED ***" if rec.is_contaminated() else "CLEAN"
-            header_line = f"── Request #{rec.request_id}  [{rec.client_id}]  {status}"
-            lines.append("")
-            lines.append(header_line + "  " + "─" * max(0, W - len(header_line) - 2))
-            lines.append("")
-
-            # ── Intended headers ──────────────────────────────────────────
-            lines.append("  Intended (client → proxy):")
-            for name, value in rec.intended_headers:
-                n = name.decode(errors="replace")
-                v = value.decode(errors="replace")
-                lines.append(f"    {n:<24}  {v}")
-
-            # ── Proxy encoding decisions ──────────────────────────────────
-            lines.append("")
-            lines.append("  Proxy encoding decisions:")
-            if not rec.insertions and not rec.references:
-                lines.append(
-                    "    (no dynamic table activity"
-                    " — all headers encoded as literals or static refs)"
-                )
-            for ev in rec.insertions:
-                n = ev.name.decode(errors="replace")
-                v = ev.value.decode(errors="replace")
-                lines.append(
-                    f"    {n:<24}  →  INSERT  abs={ev.abs_index}  value={v!r}"
-                )
-            for ev in rec.references:
-                n = ev.name.decode(errors="replace")
-                ref_v = ev.referenced_value.decode(errors="replace")
-                int_v = ev.intended_value.decode(errors="replace")
-                mismatch = ev.referenced_value != ev.intended_value
-                flag = "  ← MISMATCH" if mismatch else ""
-                lines.append(
-                    f"    {n:<24}  →  REF  rel={ev.rel_index}"
-                    f"  stored={ref_v!r}{flag}"
-                )
-                if mismatch:
-                    pad = "    " + " " * 26
-                    lines.append(f"{pad}intended={int_v!r}")
-                    if ev.inserted_by:
-                        lines.append(f"{pad}inserted_by={ev.inserted_by}")
-                    if ev.root_cause and ev.root_cause != "clean":
-                        lines.append(f"{pad}root_cause: {ev.root_cause}")
-
-            # ── Backend-received headers ──────────────────────────────────
-            lines.append("")
-            if rec.backend_headers is not None:
-                lines.append("  Backend received (decoded by server):")
-                backend_dict = dict(rec.backend_headers)
-                for name, int_value in rec.intended_headers:
-                    if name.startswith(b":"):
-                        continue
-                    n = name.decode(errors="replace")
-                    bk = backend_dict.get(name, b"(missing)")
-                    bk_str = bk.decode(errors="replace") if isinstance(bk, bytes) else str(bk)
-                    differs = bk != int_value
-                    flag = "  ← DIFFERS FROM INTENDED" if differs else ""
-                    lines.append(f"    {n:<24}  {bk_str}{flag}")
-            else:
-                lines.append(
-                    "  Backend received: not recorded"
-                    " — call record_backend_response()"
-                )
-
-            # ── Diff ──────────────────────────────────────────────────────
-            lines.append("")
-            if rec.backend_headers is not None:
-                discs = rec.compute_discrepancies()
-                if discs:
-                    lines.append("  Discrepancies:")
-                    for d in discs:
-                        lines.append(
-                            f"    {d['name']:<24}  intended : {d['intended']!r}"
-                        )
-                        lines.append(
-                            f"    {' ' * 26}  backend  : {d['backend']!r}"
-                        )
-                        lines.append(
-                            f"    {' ' * 26}  root_cause: {d['root_cause']}"
-                        )
-                else:
-                    lines.append("  Diff: no discrepancies")
-
-            # ── Evictions caused by this request ─────────────────────────
-            if rec.evictions:
-                lines.append("")
-                lines.append("  Evictions caused by this request:")
-                for ev in rec.evictions:
-                    en = ev.evicted_name.decode(errors="replace")
-                    ev_ = ev.evicted_value.decode(errors="replace")
-                    lines.append(
-                        f"    EVICTED abs={ev.evicted_abs_index}"
-                        f"  {en}: {ev_!r}"
-                        f"  (was inserted by {ev.evicted_inserted_by or 'unknown'})"
-                    )
-            lines.append("")
-
-        return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -474,23 +84,9 @@ class _SharedQpackReencoder:
     the oracle signal for Case 3.
     """
 
-    def __init__(
-        self,
-        desired_capacity: int,
-        instrumentation: ProxyInstrumentation,
-    ) -> None:
+    def __init__(self, desired_capacity: int) -> None:
         self._desired_capacity = desired_capacity
-        self._instrumentation = instrumentation
-        # Initialized with max_table_capacity=0; updated when backend SETTINGS arrive.
         self._encoder = ManualQpackEncoder(max_table_capacity=desired_capacity)
-        self._initialized = False
-        # Parallel list to self._encoder.table.entries:
-        #   _entry_owners[i] = (abs_index, client_id) for table.entries[i].
-        # Index 0 = newest entry; updated on every insert/eviction.
-        self._entry_owners: list[tuple[int, str]] = []
-        # Peer's SETTINGS_QPACK_MAX_TABLE_CAPACITY — used for RFC 9204 §3.2.6
-        # MaxEntries computation (NOT the current set capacity).
-        self._peer_max_table_capacity: int = desired_capacity
 
     def initialize(self, peer_max_capacity: int) -> bytes:
         """Called when backend SETTINGS arrive. Sets the actual table capacity.
@@ -498,54 +94,34 @@ class _SharedQpackReencoder:
         Returns the Set Dynamic Table Capacity encoder stream instruction bytes,
         or b"" if capacity is 0.
         """
-        if peer_max_capacity:
-            actual = min(self._desired_capacity, peer_max_capacity)
-            # RFC 9204 §3.2.6: MaxEntries must be computed from
-            # SETTINGS_QPACK_MAX_TABLE_CAPACITY, not the current set capacity.
-            self._peer_max_table_capacity = peer_max_capacity
-        else:
-            actual = 0
+        actual = min(self._desired_capacity, peer_max_capacity) if peer_max_capacity else 0
         self._encoder.max_table_capacity = actual
-        self._initialized = True
         if actual == 0:
             return b""
         return self._encoder.set_capacity(actual)
 
     def encode_request(
-        self, headers: list[tuple[bytes, bytes]], client_id: str
+        self, headers: list[tuple[bytes, bytes]]
     ) -> tuple[bytes, bytes]:
         """Re-encode headers for the backend using the shared table.
 
         Returns (encoder_stream_instructions, header_block_bytes).
         """
-        request_id = self._instrumentation.begin_request(client_id, headers)
         encoder_instructions = bytearray()
 
-        # ── Phase 1: insertions ──────────────────────────────────────────
-        # Insert a new entry whenever the exact (name, value) pair is not already
-        # in the table.  Use a name-reference instruction (§4.3.2) if the name
-        # exists anywhere (static or dynamic), otherwise a literal insert (§4.3.3).
-        # This minimises encoder-stream bandwidth and produces the three distinct
-        # table outcomes described in the module docstring.
+        # ── Phase 1: insertions ──────────────────────────────────────────────
         for name, value in headers:
             if name.startswith(b":"):
-                continue  # pseudo-headers are never inserted
+                continue
             if self._static_exact(name, value) is not None:
-                continue  # exact static match — no dynamic insert needed
+                continue
             if self._dynamic_exact(name, value) is not None:
-                continue  # exact dynamic match already present — will ref in Phase 2
-            instr, kind = self._try_insert(name, value, client_id, request_id)
+                continue
+            instr = self._try_insert(name, value)
             if instr:
                 encoder_instructions.extend(instr)
-                abs_idx = self._encoder.table.insert_count - 1
-                self._instrumentation.record_insertion(
-                    client_id, abs_idx, name, value,
-                    request_id=request_id, kind=kind,
-                )
 
-        # ── Phase 2: build header block ──────────────────────────────────
-        # After Phase 1 every header has an exact match in either the static or
-        # dynamic table (unless the entry was too large to fit, handled below).
+        # ── Phase 2: build header block ──────────────────────────────────────
         header_entries = []
         has_dynamic = False
         for name, value in headers:
@@ -555,17 +131,9 @@ class _SharedQpackReencoder:
             else:
                 dyn_idx = self._dynamic_exact(name, value)
                 if dyn_idx is not None:
-                    inserter = self._get_inserter_by_name(name)
-                    self._instrumentation.record_reference(
-                        client_id, dyn_idx, name, value, value,
-                        request_id=request_id,
-                        inserted_by=inserter,
-                        root_cause="clean",
-                    )
                     header_entries.append(("dynamic", dyn_idx, name, value))
                     has_dynamic = True
                 else:
-                    # Entry was too large to insert; fall back to a name ref or literal.
                     static_name_idx = self._static_name_only(name)
                     if static_name_idx is not None:
                         header_entries.append(
@@ -576,15 +144,9 @@ class _SharedQpackReencoder:
 
         if has_dynamic:
             insert_count = self._encoder.table.insert_count
-            # RFC 9204 §3.2.4: RIC MUST equal max referenced abs_idx + 1.
-            # entries[i] has abs_idx = insert_count - 1 - i, so the oldest
-            # referenced entry (largest i = min_arg) gives the smallest abs_idx.
-            # ric = (insert_count - 1 - min_arg) + 1 = insert_count - min_arg.
             dyn_args = [arg for kind, arg, _, _ in header_entries if kind == "dynamic"]
             min_arg = min(dyn_args)
             ric = insert_count - min_arg
-            # Recompute pre-base relative indices for Base=ric (DeltaBase=0).
-            # new_rel_idx = ric - 1 - abs_idx = arg - min_arg.
             header_entries = [
                 ("dynamic", arg - min_arg, name, value) if kind == "dynamic"
                 else (kind, arg, name, value)
@@ -600,138 +162,54 @@ class _SharedQpackReencoder:
     # Private helpers
     # ------------------------------------------------------------------
 
-    def _try_insert(
-        self, name: bytes, value: bytes, client_id: str, request_id: int
-    ) -> tuple[Optional[bytes], str]:
+    def _try_insert(self, name: bytes, value: bytes) -> Optional[bytes]:
         """Attempt to insert (name, value) into the dynamic table.
 
-        Chooses the most efficient instruction:
-          - §4.3.2 with S=1 if name is in the static table
-          - §4.3.2 with S=0 if name is in the dynamic table
-          - §4.3.3 literal otherwise
-
-        Detects evictions, records EvictionEvents, updates _entry_owners.
-        Returns (wire-format instruction bytes, kind) or (None, "") if the
-        entry is too large to ever fit.
+        Returns wire-format instruction bytes, or None if the entry is too
+        large to fit. DynamicTableTracker.insert() handles eviction of older
+        entries to make room in accordance with RFC 9204 §3.2.2.
         """
         table = self._encoder.table
-        entry_size = len(name) + len(value) + ENTRY_OVERHEAD
-        if entry_size > table.capacity:
-            return None, ""  # can never fit, even with a fully empty table
-
-        # Predict which existing entries will be evicted
-        evictions = self._predict_evictions(entry_size)
-
+        if len(name) + len(value) + ENTRY_OVERHEAD > table.capacity:
+            return None
         try:
             static_idx = self._static_name_only(name)
             dyn_result = self._dynamic_by_name(name)
             if static_idx is not None:
-                instr = self._encoder.insert_name_ref(static_idx, value, is_static=True)
-                kind = "static_name_ref"
+                return self._encoder.insert_name_ref(static_idx, value, is_static=True)
             elif dyn_result is not None:
                 rel_idx, _ = dyn_result
-                instr = self._encoder.insert_name_ref(rel_idx, value, is_static=False)
-                kind = "dynamic_name_ref"
+                return self._encoder.insert_name_ref(rel_idx, value, is_static=False)
             else:
-                instr = self._encoder.insert_literal(name, value)
-                kind = "literal"
+                return self._encoder.insert_literal(name, value)
         except ValueError:
-            return None, ""  # unexpected; safety net
-
-        new_abs = table.insert_count - 1
-
-        # Record eviction events and trim _entry_owners from the tail
-        for ev_abs, ev_name, ev_value, ev_by in evictions:
-            self._instrumentation.record_eviction(
-                evicted_name=ev_name,
-                evicted_value=ev_value,
-                evicted_abs_index=ev_abs,
-                evicted_inserted_by=ev_by,
-                triggered_by_client_id=client_id,
-                triggered_by_request_id=request_id,
-            )
-        for _ in evictions:
-            self._entry_owners.pop()
-
-        # Prepend new entry to _entry_owners (index 0 = newest)
-        self._entry_owners.insert(0, (new_abs, client_id))
-
-        return instr, kind
-
-    def _predict_evictions(
-        self, entry_size: int
-    ) -> list[tuple[int, bytes, bytes, str]]:
-        """Return metadata for entries that will be evicted by inserting entry_size bytes.
-
-        Returns list of (abs_index, name, value, client_id) in eviction order
-        (oldest first), matching the order DynamicTableTracker.insert() evicts them.
-        """
-        table = self._encoder.table
-        needed = table.current_size() + entry_size - table.capacity
-        if needed <= 0:
-            return []
-        to_evict: list[tuple[int, bytes, bytes, str]] = []
-        freed = 0
-        for i in range(len(table.entries) - 1, -1, -1):
-            e = table.entries[i]
-            if i < len(self._entry_owners):
-                abs_idx, owner = self._entry_owners[i]
-            else:
-                abs_idx, owner = -1, ""
-            to_evict.append((abs_idx, e.name, e.value, owner))
-            freed += e.size
-            if freed >= needed:
-                break
-        return to_evict
-
-    def _get_inserter_by_name(self, name: bytes) -> str:
-        """Return the client_id that inserted the dynamic table entry currently
-        matching the given name (first/newest match)."""
-        for i, entry in enumerate(self._encoder.table.entries):
-            if entry.name == name:
-                if i < len(self._entry_owners):
-                    return self._entry_owners[i][1]
-                return ""
-        return ""
+            return None
 
     def _dynamic_exact(self, name: bytes, value: bytes) -> Optional[int]:
-        """Return relative_index for an exact (name, value) match in the dynamic table."""
         for i, entry in enumerate(self._encoder.table.entries):
             if entry.name == name and entry.value == value:
                 return i
         return None
 
     def _static_exact(self, name: bytes, value: bytes) -> Optional[int]:
-        """Return the 0-based static table index for an exact (name, value) match."""
         for i, (sn, sv) in enumerate(STATIC_TABLE):
             if sn == name and sv == value:
                 return i
         return None
 
     def _static_name_only(self, name: bytes) -> Optional[int]:
-        """Return the 0-based static table index for the first name match."""
         for i, (sn, _) in enumerate(STATIC_TABLE):
             if sn == name:
                 return i
         return None
 
     def _dynamic_by_name(self, name: bytes) -> Optional[tuple[int, bytes]]:
-        """Return (relative_index, stored_value) for the first name match.
-
-        Relative index 0 = most recently inserted entry (entries[0]).
-        With Base = RIC = insert_count, relative_index equals the position
-        in the entries list.
-        """
         for i, entry in enumerate(self._encoder.table.entries):
             if entry.name == name:
                 return (i, entry.value)
         return None
 
-    def _build_header_block(
-        self,
-        header_entries: list,
-        ric: int,
-    ) -> bytes:
+    def _build_header_block(self, header_entries: list, ric: int) -> bytes:
         """Encode a QPACK header block.
 
         header_entries items:
@@ -747,65 +225,51 @@ class _SharedQpackReencoder:
         """
         buf = bytearray()
 
-        # --- Prefix ---
         if ric == 0:
             buf.extend(b"\x00\x00")
         else:
-            # RFC 9204 §3.2.6: MaxEntries MUST use SETTINGS_QPACK_MAX_TABLE_CAPACITY
-            # (peer's advertised maximum), NOT the current set capacity.  Using the
-            # set capacity (e.g., 512) instead of SETTINGS (e.g., 4096) produces a
-            # smaller FullRange, causing encoded_ric to wrap to 1 sooner than the
-            # decoder expects, yielding DecompressionFailed.
-            max_entries = max(1, self._peer_max_table_capacity // 32)
+            # RFC 9204 §3.2.6: lsqpack derives MaxEntries from the current set
+            # capacity (Set Dynamic Table Capacity instruction), not from
+            # SETTINGS_QPACK_MAX_TABLE_CAPACITY. Use capacity // 32 accordingly.
+            max_entries = max(1, self._encoder.table.capacity // 32)
             encoded_ric = (ric % (2 * max_entries)) + 1
             ric_bytes = bytearray(encode_integer(encoded_ric, 8))
             buf.extend(ric_bytes)
             buf.extend(b"\x00")  # S=0, Delta Base=0
 
-        # --- Field representations ---
         for kind, arg, name, value in header_entries:
             if kind == "static":
-                idx = arg
-                b = bytearray(encode_integer(idx, 6))
+                b = bytearray(encode_integer(arg, 6))
                 b[0] |= 0xC0
                 buf.extend(b)
 
             elif kind == "dynamic":
-                rel_idx = arg
-                b = bytearray(encode_integer(rel_idx, 6))
+                b = bytearray(encode_integer(arg, 6))
                 b[0] |= 0x80  # T=0, pre-base indexed field line
                 buf.extend(b)
 
             elif kind == "static_name_ref":
-                idx = arg
                 # Literal Field Line with Name Reference, S=1 (static), N=0
-                # RFC 9204 §4.5.4 — bits: 0 1 N=0 S=1 [4-bit Name Index]
-                b = bytearray(encode_integer(idx, 4))
+                b = bytearray(encode_integer(arg, 4))
                 b[0] |= 0x50
                 buf.extend(b)
-                val_len_b = encode_integer(len(value), 7)
-                buf.extend(val_len_b)
+                buf.extend(encode_integer(len(value), 7))
                 buf.extend(value)
 
             elif kind == "dyn_name_ref":
-                rel_idx = arg
                 # Literal Field Line with Name Reference, S=0 (dynamic), N=0
-                # RFC 9204 §4.5.4 — bits: 0 1 N=0 S=0 [4-bit Name Index]
-                b = bytearray(encode_integer(rel_idx, 4))
+                b = bytearray(encode_integer(arg, 4))
                 b[0] |= 0x40
                 buf.extend(b)
-                val_len_b = encode_integer(len(value), 7)
-                buf.extend(val_len_b)
+                buf.extend(encode_integer(len(value), 7))
                 buf.extend(value)
 
             else:  # "literal"
-                # Literal Field Line with Literal Name (RFC 9204 §4.5.6)
                 name_len_b = bytearray(encode_integer(len(name), 3))
                 name_len_b[0] |= 0x20  # opcode bits 7-5 = 001
                 buf.extend(name_len_b)
                 buf.extend(name)
-                val_len_b = encode_integer(len(value), 7)
-                buf.extend(val_len_b)
+                buf.extend(encode_integer(len(value), 7))
                 buf.extend(value)
 
         return bytes(buf)
@@ -828,22 +292,17 @@ class _BackendH3Connection(H3Connection):
         self._shared_qpack = shared_qpack
         self._on_settings_ready = on_settings_ready
         self._decoder_log: list[bytes] = []
-        self._active_client_id: str = ""
 
-        # super().__init__ calls _init_connection() which sends SETTINGS.
-        # It creates self._encoder = pylsqpack.Encoder() before we can intercept.
         super().__init__(quic)
 
         # Replace encoder with our proxy AFTER super().__init__
-        real_encoder = self._encoder
         self._encoder = _EncoderProxy(  # type: ignore
-            real_encoder,
+            self._encoder,
             on_settings=self._handle_peer_settings,
             decoder_log=self._decoder_log,
         )
 
     def _handle_peer_settings(self, max_cap: int, blocked: int) -> None:
-        """Called by _EncoderProxy when backend SETTINGS arrive."""
         assert self._local_encoder_stream_id is not None
         instructions = self._shared_qpack.initialize(max_cap)
         if instructions:
@@ -851,26 +310,11 @@ class _BackendH3Connection(H3Connection):
         self._on_settings_ready()
 
     def _encode_headers(self, stream_id: int, headers) -> bytes:
-        """Override: use shared QPACK re-encoder instead of pylsqpack."""
         assert self._local_encoder_stream_id is not None
-        encoder_instr, header_block = self._shared_qpack.encode_request(
-            list(headers), self._active_client_id
-        )
+        encoder_instr, header_block = self._shared_qpack.encode_request(list(headers))
         if encoder_instr:
             self._quic.send_stream_data(self._local_encoder_stream_id, encoder_instr)
         return header_block
-
-    def send_for_client(
-        self,
-        stream_id: int,
-        headers: list[tuple[bytes, bytes]],
-        client_id: str,
-        end_stream: bool = False,
-    ) -> None:
-        """Send headers tagged with the originating client ID."""
-        self._active_client_id = client_id
-        self.send_headers(stream_id, headers, end_stream=end_stream)
-        self._active_client_id = ""
 
 
 # ---------------------------------------------------------------------------
@@ -939,7 +383,6 @@ class _BackendProtocol(QuicConnectionProtocol):
         frontend: "_FrontendProtocol",
         client_sid: int,
         headers: list[tuple[bytes, bytes]],
-        client_id: str,
         data: bytes = b"",
         stream_ended: bool = True,
     ) -> int:
@@ -948,7 +391,7 @@ class _BackendProtocol(QuicConnectionProtocol):
         sid = self._quic.get_next_available_stream_id()
         self._routes[sid] = (frontend, client_sid)
         end_headers = stream_ended and not data
-        self._http.send_for_client(sid, headers, client_id, end_stream=end_headers)
+        self._http.send_headers(sid, headers, end_stream=end_headers)
         if data:
             self._http.send_data(stream_id=sid, data=data, end_stream=stream_ended)
         self.transmit()
@@ -962,22 +405,17 @@ class _BackendProtocol(QuicConnectionProtocol):
 
 class _PendingRequest:
     """Buffers a client request until the backend connection is ready."""
-    __slots__ = ("headers", "data", "stream_ended", "client_id")
+    __slots__ = ("headers", "data", "stream_ended")
 
-    def __init__(
-        self, headers: list, stream_ended: bool, client_id: str
-    ) -> None:
+    def __init__(self, headers: list, stream_ended: bool) -> None:
         self.headers = headers
         self.data = b""
         self.stream_ended = stream_ended
-        self.client_id = client_id
 
 
 # ---------------------------------------------------------------------------
 # _FrontendProtocol
 # ---------------------------------------------------------------------------
-
-_client_counter = 0
 
 
 class _FrontendProtocol(QuicConnectionProtocol):
@@ -985,9 +423,6 @@ class _FrontendProtocol(QuicConnectionProtocol):
 
     def __init__(self, *args, proxy: "FaultyProxy", **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        global _client_counter
-        _client_counter += 1
-        self._client_id = f"client-{_client_counter - 1}"
         self._http: Optional[H3Connection] = None
         self._proxy = proxy
         self._backend: Optional[_BackendProtocol] = None
@@ -1008,8 +443,7 @@ class _FrontendProtocol(QuicConnectionProtocol):
             self._backend = await self._proxy.get_backend()
             for client_sid, req in self._pending.items():
                 backend_sid = self._backend.forward_request(
-                    self, client_sid, req.headers, req.client_id,
-                    req.data, req.stream_ended,
+                    self, client_sid, req.headers, req.data, req.stream_ended,
                 )
                 if not req.stream_ended:
                     self._client_to_backend[client_sid] = backend_sid
@@ -1021,7 +455,7 @@ class _FrontendProtocol(QuicConnectionProtocol):
         if isinstance(event, HeadersReceived):
             if self._backend is not None:
                 backend_sid = self._backend.forward_request(
-                    self, event.stream_id, event.headers, self._client_id,
+                    self, event.stream_id, event.headers,
                     stream_ended=event.stream_ended,
                 )
                 if not event.stream_ended:
@@ -1030,7 +464,6 @@ class _FrontendProtocol(QuicConnectionProtocol):
                 self._pending[event.stream_id] = _PendingRequest(
                     headers=event.headers,
                     stream_ended=event.stream_ended,
-                    client_id=self._client_id,
                 )
         elif isinstance(event, DataReceived):
             if event.stream_id in self._client_to_backend:
@@ -1061,30 +494,22 @@ class FaultyProxy:
 
     All frontend clients share a single backend H3 connection with a single
     RFC-compliant QPACK encoder.  Forwarded headers are re-encoded using the
-    shared dynamic table; the three possible table outcomes per request pair
-    are described in the module docstring.
+    shared dynamic table; entries are evicted in FIFO order as the table fills
+    per RFC 9204 §3.2.2.
 
     Args:
         table_capacity: Desired dynamic table capacity in bytes.
     """
 
-    def __init__(
-        self,
-        table_capacity: int = 4096,
-    ) -> None:
+    def __init__(self, table_capacity: int = 4096) -> None:
         self._table_capacity = table_capacity
-        self._instrumentation = ProxyInstrumentation(capacity=table_capacity)
-        self._shared_qpack = _SharedQpackReencoder(
-            desired_capacity=table_capacity,
-            instrumentation=self._instrumentation,
-        )
+        self._shared_qpack = _SharedQpackReencoder(desired_capacity=table_capacity)
         self._server: Optional[QuicServer] = None
         self._port: Optional[int] = None
         self._backend_host: Optional[str] = None
         self._backend_port: Optional[int] = None
         self._backend_addr = None
         self._backend_transports: list = []
-        # Shared backend Future — prevents duplicate connections on concurrent connects
         self._shared_future: Optional[asyncio.Future] = None
 
     async def start(
@@ -1096,9 +521,6 @@ class FaultyProxy:
         key_file: str,
     ) -> int:
         """Start the proxy. Returns the actual listening port."""
-        global _client_counter
-        _client_counter = 0  # reset for each test
-
         self._backend_host = backend_host
         self._backend_port = backend_port
 
@@ -1135,10 +557,6 @@ class FaultyProxy:
     def port(self) -> int:
         assert self._port is not None
         return self._port
-
-    @property
-    def instrumentation(self) -> ProxyInstrumentation:
-        return self._instrumentation
 
     async def get_backend(self) -> _BackendProtocol:
         """Return the single shared backend connection (create on first call)."""

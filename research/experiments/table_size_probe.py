@@ -34,9 +34,14 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 import socket
 import ssl
 from collections import deque
+
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 from aioquic.asyncio.protocol import QuicConnectionProtocol
 from aioquic.h3.connection import H3_ALPN, H3Connection, Setting

@@ -1,4 +1,4 @@
-"""Timing side-channel: canary insertion vs. cache-hit probe latency.
+"""Timing side-channel: canary re-insertion vs. cache-hit probe latency.
 
 Runs eviction cycles using the same canary/filler approach as
 table_size_probe, recording the round-trip time of every probe request
@@ -18,20 +18,21 @@ With a 512-byte table:
     filler size  = 38 bytes   (name=f{NNNN} 5 bytes, value=b"q", +32 overhead)
     max fillers alongside canary = floor((512-49)/38) = 12
     eviction period = 13 fillers  (every 13 filler inserts evicts the canary)
-    fillers needed for 100 evictions ≈ 13 × 100 = 1300
+    fillers needed for N evictions ≈ 13 × N
 
 Two timing groups compared:
 
-  hit  — proxy found canary in the dynamic table; no encoder stream
-          instruction emitted.
+  re-insertion — proxy found canary evicted; emits an insert_literal
+                 instruction on the encoder stream; backend must call
+                 feed_encoder() before decoding the HEADERS frame.
 
-  miss — canary had been evicted; proxy emits an insert_literal
-          instruction on the encoder stream and the backend must call
-          feed_encoder() before decoding the HEADERS frame.
+  hit          — proxy found canary in the dynamic table; no encoder
+                 stream instruction emitted.
 
-The Phase-1 initial insert (which includes TLS + QUIC connection
-warm-up) is recorded separately and excluded from the miss bucket so
-it does not bias the statistics.
+N_SAMPLES re-insertion samples are collected (Phase-1 warm-up excluded).
+N_SAMPLES hit samples are drawn uniformly at random from all hit probes.
+The two equal-size distributions are compared with a Mann-Whitney U test
+and plotted as overlapping histograms saved to probe_timing_results.png.
 
 Usage
 -----
@@ -42,12 +43,21 @@ Usage
 from __future__ import annotations
 
 import asyncio
+import csv
 import os
+import sys
+import random
 import socket
 import ssl
 import statistics
 import time
 from collections import deque
+
+# Allow running directly (python3 probe_timing.py) from any directory.
+# Inserts aioquic_99/ root so that "research.*" and "aioquic.*" resolve.
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 from aioquic.asyncio.protocol import QuicConnectionProtocol
 from aioquic.h3.connection import H3_ALPN, H3Connection, Setting
@@ -75,20 +85,32 @@ KEY  = os.path.join(_HERE, "..", "..", "tests", "ssl_key.pem")
 # RFC 9204 §3.2.3 — the proxy sends Set Dynamic Table Capacity = 512 on the
 # encoder stream at backend-connection time, reducing from the echo server's
 # advertised maximum to this smaller working capacity.
-TABLE_CAPACITY  = 512
+TABLE_CAPACITY = 512
 
-TARGET_MISSES = 100   # stop after this many eviction detections
-MAX_FILLERS   = 1350  # safety upper bound (100 evictions need ≈1300 fillers)
+# Number of re-insertion (miss) samples to collect.  The same number of hit
+# samples is drawn uniformly at random from all hit probes so both
+# distributions have equal size before statistical comparison.
+N_SAMPLES = 100
 
 CANARY_NAME  = b"x-canary"
 CANARY_VALUE = b"sentinel0"
 CANARY_SIZE  = len(CANARY_NAME) + len(CANARY_VALUE) + ENTRY_OVERHEAD  # 49 bytes
 
 # 5-byte fixed-length names (f0000-f9999) keep FILLER_SIZE constant across
-# the full 1300-filler range.  Mixing 4- and 5-byte names would silently
-# shift the eviction boundary mid-experiment.
+# the full filler range.  Mixing 4- and 5-byte names would silently shift
+# the eviction boundary mid-experiment.
 FILLER_VALUE = b"q"
 FILLER_SIZE  = 5 + len(FILLER_VALUE) + ENTRY_OVERHEAD  # 38 bytes
+
+# Derived: eviction period (fillers per canary eviction cycle).
+_MAX_FILLERS_WITH_CANARY = (TABLE_CAPACITY - CANARY_SIZE) // FILLER_SIZE  # 12
+_EVICTION_PERIOD         = _MAX_FILLERS_WITH_CANARY + 1                   # 13
+
+# Safety upper bound derived from N_SAMPLES so it always tracks the target.
+# Two extra eviction periods of headroom handle timing jitter.
+MAX_FILLERS = N_SAMPLES * _EVICTION_PERIOD + 2 * _EVICTION_PERIOD
+
+CSV_OUT = os.path.join(_HERE, "probe_timing_data.csv")
 
 
 def filler_name(i: int) -> bytes:
@@ -253,11 +275,26 @@ def _print_stats(label: str, s: dict) -> None:
         print(f"  {label}: no samples")
         return
     print(
-        f"  {label:<8} n={s['n']:>4}   "
+        f"  {label:<14} n={s['n']:>4}   "
         f"mean={_µs(s['mean_ns']):>10}  ±{_µs(s['stdev_ns']):>9}   "
         f"median={_µs(s['median_ns']):>10}   "
         f"[{_µs(s['min_ns'])} – {_µs(s['max_ns'])}]"
     )
+
+
+# ---------------------------------------------------------------------------
+# CSV output
+# ---------------------------------------------------------------------------
+
+
+def _save_csv(hit_sample: list[int], miss_ns: list[int]) -> None:
+    """Save hit_ns and reinsertion_ns columns to CSV_OUT (N rows each)."""
+    with open(CSV_OUT, "w", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["hit_ns", "reinsertion_ns"])
+        for h, r in zip(hit_sample, miss_ns):
+            writer.writerow([h, r])
+    print(f"  CSV saved → {CSV_OUT}")
 
 
 # ---------------------------------------------------------------------------
@@ -266,12 +303,12 @@ def _print_stats(label: str, s: dict) -> None:
 
 
 async def run() -> None:
-    # Expected eviction period given table / entry sizes
     max_fillers_with_canary = (TABLE_CAPACITY - CANARY_SIZE) // FILLER_SIZE
     eviction_period = max_fillers_with_canary + 1
 
     print("=" * 78)
-    print("PROBE TIMING: CANARY HIT vs. MISS LATENCY  (512-byte table, 100 misses)")
+    print(f"PROBE TIMING: RE-INSERTION vs. HIT LATENCY  "
+          f"(table={TABLE_CAPACITY} B, N={N_SAMPLES})")
     print("=" * 78)
     print()
     print("Timer:  time.perf_counter_ns()  (CLOCK_MONOTONIC, nanosecond resolution)")
@@ -281,8 +318,9 @@ async def run() -> None:
     print(f"Filler: f{{NNNN}} = {FILLER_VALUE!r}  ({FILLER_SIZE} bytes, 5-byte fixed name)")
     print(f"Max fillers alongside canary: {max_fillers_with_canary}  "
           f"→ eviction every {eviction_period} fillers")
-    print(f"Target: {TARGET_MISSES} miss samples  "
-          f"(Phase-1 warm-up excluded from miss bucket)")
+    print(f"Target: {N_SAMPLES} re-insertion samples  "
+          f"(Phase-1 warm-up excluded from re-insertion bucket)")
+    print(f"Hit sample: {N_SAMPLES} drawn uniformly at random from all hit probes")
     print()
 
     server = EchoServer()
@@ -303,8 +341,8 @@ async def run() -> None:
     miss_ns: list[int] = []
 
     try:
-        # ── Phase 1: insert canary (excluded from miss bucket) ──────────────
-        print("Phase 1: Insert canary  [timing excluded from stats — connection warm-up]")
+        # ── Phase 1: insert canary (excluded from re-insertion bucket) ───────
+        print("Phase 1: Insert canary  [timing excluded — connection warm-up]")
         print("─" * 78)
         _, t_warmup = await client.get(
             "localhost", proxy_port, "/canary",
@@ -358,7 +396,6 @@ async def run() -> None:
                 eviction_count += 1
                 miss_ns.append(elapsed_ns)
 
-                # Summarise this cycle's hit samples before printing the eviction.
                 cyc_s = _stats(hits_this_cycle)
                 if cyc_s:
                     cyc_summary = (
@@ -378,27 +415,37 @@ async def run() -> None:
                 hit_ns.append(elapsed_ns)
                 hits_this_cycle.append(elapsed_ns)
 
-            if eviction_count >= TARGET_MISSES:
+            if eviction_count >= N_SAMPLES:
                 break
 
         print()
 
-        # ── Phase 3: results ────────────────────────────────────────────────
+        # ── Phase 3: random hit subsample ───────────────────────────────────
+        if len(hit_ns) < N_SAMPLES:
+            print(f"  WARNING: only {len(hit_ns)} hit samples collected "
+                  f"(need {N_SAMPLES}); using all available hits.")
+            hit_sample = hit_ns[:]
+        else:
+            hit_sample = random.sample(hit_ns, N_SAMPLES)
+
+        # ── Phase 4: statistics ─────────────────────────────────────────────
         print("Phase 3: Timing results")
         print("─" * 78)
         print()
-        print(f"  Probe requests:  {len(hit_ns) + len(miss_ns)}  total  "
-              f"({len(hit_ns)} hits, {len(miss_ns)} misses)")
+        print(f"  Total probe requests:  {len(hit_ns) + len(miss_ns)}  "
+              f"({len(hit_ns)} hits collected, {len(miss_ns)} re-insertions)")
+        print(f"  Hit sample drawn:      {len(hit_sample)} of {len(hit_ns)} "
+              f"(uniform random, seed not fixed)")
         print(f"  Warm-up RTT (Phase-1, excluded): {_µs(t_warmup)}")
         print()
 
-        hit_s  = _stats(hit_ns)
+        hit_s  = _stats(hit_sample)
         miss_s = _stats(miss_ns)
 
         print("  Round-trip latency (time.perf_counter_ns, client perspective):")
         print()
-        _print_stats("hit", hit_s)
-        _print_stats("miss", miss_s)
+        _print_stats("hit (sample)", hit_s)
+        _print_stats("re-insertion", miss_s)
         print()
 
         if hit_s and miss_s:
@@ -413,7 +460,12 @@ async def run() -> None:
             if se_diff > 0:
                 z = abs(delta) / se_diff
                 print(f"  z-score:            {z:.2f}  "
-                      f"({'signal detectable' if z > 2 else 'within noise floor'})")
+                      f"({'signal detectable' if z > 2 else 'within noise floor on loopback'})")
+            print()
+
+        # ── Save CSV ────────────────────────────────────────────────────────
+        _save_csv(hit_sample, miss_ns)
+        print(f"  Run timing_analysis.py to view statistics and classifier results.")
 
     finally:
         client.close()
